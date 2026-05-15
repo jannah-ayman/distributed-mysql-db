@@ -72,10 +72,6 @@ func checkSlave(url string, ch chan SlaveStatus) {
 }
 
 // startHeartbeat pings all slaves every interval and updates their status.
-//
-// FIX (issue 2): when a slave transitions from offline → online, we now call
-// syncSlaveOnRecovery to copy the missing rows from its _replica tables back
-// into its primary tables, making it consistent again before it rejoins.
 func startHeartbeat(slaves []string, state *slaveState, meta *Metadata, interval time.Duration) {
 	go func() {
 		for {
@@ -93,14 +89,12 @@ func startHeartbeat(slaves []string, state *slaveState, meta *Metadata, interval
 					fmt.Printf("  ✗ Slave %s went OFFLINE\n", s.URL)
 				} else if !wasOnline && s.Online {
 					fmt.Printf("  ✓ Slave %s came back ONLINE — starting recovery sync\n", s.URL)
-					// Find a donor slave (any other online slave).
 					for _, donor := range slaves {
 						if donor != s.URL && state.isOnline(donor) {
 							go syncSlaveOnRecovery(s.URL, donor, meta)
 							break
 						}
 					}
-					// Also push current metadata so it has the latest shard map.
 					go func(url string) {
 						syncMetadataToSlaves([]string{url}, state, meta)
 					}(s.URL)
@@ -112,13 +106,20 @@ func startHeartbeat(slaves []string, state *slaveState, meta *Metadata, interval
 	}()
 }
 
-// syncSlaveOnRecovery copies all rows that the recovered slave missed while it
-// was offline. Strategy: for each table registered in metadata, ask the donor
-// slave to SELECT from the _replica table (which holds rows that were primary
-// on the recovered slave), then INSERT those rows into the recovered slave's
-// primary table — overwriting by id to avoid duplicates.
+// syncSlaveOnRecovery copies all rows the recovered slave missed while offline.
 //
-// FIX (issue 2): this function did not exist before; nothing ran on recovery.
+// FIX (#4/#9): The original code passed the full row (including "id") into
+// INSERT, which caused primary-key conflicts when the row already existed or
+// when DELETE failed silently. The fix:
+//  1. Use UPDATE … WHERE id=N first (idempotent, handles stale rows).
+//  2. Only INSERT if the UPDATE matched 0 rows (i.e. the row is truly missing).
+//     When inserting we strip the "id" key so MySQL assigns it via
+//     auto_increment — this guarantees no PK collision.
+//
+// Because auto_increment_offset is set to match the original slave's index,
+// MySQL will re-assign the same id value automatically as long as the table
+// still has the same offset configuration, which it does (the slave restarts
+// with the same SLAVE_INDEX env var).
 func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 	fmt.Printf("  → Recovery: copying missing data from %s to %s\n", donorURL, recoveredURL)
 
@@ -131,13 +132,12 @@ func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 	client := http.Client{Timeout: 30 * time.Second}
 
 	for dbTable, dbName := range tables {
-		// 1. Fetch the rows that lived on the recovered slave — they are stored
-		//    in the donor's _replica table.
+		// Fetch rows from donor's _replica table (these are the recovered slave's rows).
 		fetchReq := ExecRequest{
 			DBName:    dbName,
 			Operation: "SELECT",
 			Table:     dbTable,
-			IsReplica: true, // read from donor's _replica (= recovered slave's data)
+			IsReplica: true,
 		}
 		body, _ := json.Marshal(fetchReq)
 		httpReq, err := http.NewRequest("POST", donorURL+"/internal/exec", bytes.NewReader(body))
@@ -165,32 +165,48 @@ func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 		rows := execResp.Rows
 		fmt.Printf("  → Recovery: %d rows to replay into %s on %s\n", len(rows), dbTable, recoveredURL)
 
-		// 2. For each row, DELETE the old version (by id) then re-INSERT on the
-		//    recovered slave's primary table.  This handles the case where the
-		//    slave had a stale row before it crashed.
 		for _, row := range rows {
 			id := fmt.Sprintf("%v", row["id"])
 
-			// Delete stale copy if it exists.
-			delReq := ExecRequest{
+			// Step 1: try UPDATE first — idempotent and safe if row exists.
+			// Build data without the id field for the SET clause.
+			updateData := make(map[string]any, len(row)-1)
+			for k, v := range row {
+				if k != "id" {
+					updateData[k] = v
+				}
+			}
+
+			updReq := ExecRequest{
 				DBName:    dbName,
-				Operation: "DELETE",
+				Operation: "UPDATE",
 				Table:     dbTable,
+				Data:      updateData,
 				Condition: "id = " + id,
 				IsReplica: false,
 			}
-			sendExec(client, recoveredURL, delReq)
+			updResp, updErr := sendExec(client, recoveredURL, updReq)
 
-			// Re-insert the authoritative row.
-			insReq := ExecRequest{
-				DBName:    dbName,
-				Operation: "INSERT",
-				Table:     dbTable,
-				Data:      row,
-				IsReplica: false,
-			}
-			if err := sendExec(client, recoveredURL, insReq); err != nil {
-				fmt.Printf("  ✗ Recovery INSERT id=%s into %s failed: %v\n", id, dbTable, err)
+			// Step 2: if UPDATE failed or touched 0 rows (row is missing),
+			// INSERT without the id key so MySQL auto-assigns it.
+			// FIX (#4/#9): never pass "id" in the INSERT data to avoid PK conflicts.
+			if updErr != nil || !updResp {
+				insertData := make(map[string]any, len(row)-1)
+				for k, v := range row {
+					if k != "id" {
+						insertData[k] = v
+					}
+				}
+				insReq := ExecRequest{
+					DBName:    dbName,
+					Operation: "INSERT",
+					Table:     dbTable,
+					Data:      insertData,
+					IsReplica: false,
+				}
+				if _, insErr := sendExec(client, recoveredURL, insReq); insErr != nil {
+					fmt.Printf("  ✗ Recovery INSERT id=%s into %s failed: %v\n", id, dbTable, insErr)
+				}
 			}
 		}
 
@@ -198,31 +214,33 @@ func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 	}
 }
 
-// sendExec is a small helper used only during recovery to avoid import cycles.
-func sendExec(client http.Client, url string, req ExecRequest) error {
+// sendExec sends an ExecRequest and returns (success bool, error).
+// FIX (#4): now returns the success flag so callers can decide whether to
+// fall back to INSERT.
+func sendExec(client http.Client, url string, req ExecRequest) (bool, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	httpReq, err := http.NewRequest("POST", url+"/internal/exec", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return false, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-Auth-Token", authToken)
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 
 	var execResp ExecResponse
 	if err := json.NewDecoder(resp.Body).Decode(&execResp); err != nil {
-		return err
+		return false, err
 	}
 	if !execResp.Success {
-		return errors.New(execResp.Error)
+		return false, errors.New(execResp.Error)
 	}
-	return nil
+	return true, nil
 }

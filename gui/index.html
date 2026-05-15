@@ -424,7 +424,7 @@
   <aside class="sidebar">
     <div class="sidebar-logo">
       <span>distrib-db</span>
-      <small>master @ :8095</small>
+      <small id="master-label">master @ :8095</small>
     </div>
 
     <nav>
@@ -653,7 +653,6 @@
   <script>
     const TOKEN = "my-secret-token-123"
 
-    // All cluster nodes the GUI knows about, in priority order.
     // Real master first, then slaves (which may be promoted).
     const KNOWN_NODES = [
       "http://localhost:8095",
@@ -661,19 +660,24 @@
       "http://localhost:8082"
     ]
 
+    // The real master port — used to skip the /promote check for the master itself.
+    const REAL_MASTER = KNOWN_NODES[0]
+
     const headers = {
       "Content-Type": "application/json",
       "X-Auth-Token": TOKEN
     }
 
-    // The node the GUI is currently talking to.
-    let activeMaster = KNOWN_NODES[0]
+    let activeMaster = REAL_MASTER
 
     // ---- Master discovery ----
-    // Try each known node's /ping. The real master always responds on :8095.
-    // If it's down, a promoted slave will also respond on its port.
-    // We don't need a special /master-url endpoint — just find whoever is alive
-    // and that's who we talk to.
+    // FIX (#6): The old code picked the first node that replied to /ping,
+    // which could be a non-promoted slave — those reply 200 to /ping but
+    // return 503 on every real API call. The fix:
+    //   1. Try the real master first — if it replies, use it (no /promote check needed).
+    //   2. For slave nodes, also check /promote and only use them if
+    //      acting_master === true. This ensures we only talk to a slave
+    //      when it has actually taken over.
     async function discoverMaster() {
       for (const node of KNOWN_NODES) {
         try {
@@ -681,16 +685,42 @@
             headers,
             signal: AbortSignal.timeout(2000)
           })
-          if (r.ok) {
-            activeMaster = node
-            document.querySelector(".sidebar-logo small").textContent =
-              "master @ " + node.replace("http://", "")
-            console.log("Active master:", node)
+          if (!r.ok) continue
+
+          // The real master doesn't need a /promote check.
+          if (node === REAL_MASTER) {
+            setActiveMaster(node)
             return
           }
-        } catch { /* unreachable, try next */ }
+
+          // For slave nodes, verify they are actually acting as master.
+          // FIX (#6): without this check we'd send all requests to a normal
+          // slave which returns 503 on every GUI-facing endpoint.
+          try {
+            const pr = await fetch(node + "/promote", {
+              headers,
+              signal: AbortSignal.timeout(2000)
+            })
+            const pd = await pr.json()
+            if (pd.acting_master) {
+              setActiveMaster(node)
+              return
+            }
+          } catch {
+            // /promote unreachable — skip this node
+          }
+        } catch { /* node unreachable, try next */ }
       }
-      console.warn("No nodes reachable")
+      console.warn("No active master found")
+    }
+
+    function setActiveMaster(node) {
+      activeMaster = node
+      const label = node === REAL_MASTER
+        ? "master @ :8095"
+        : "promoted slave @ " + node.replace("http://localhost:", ":")
+      document.getElementById("master-label").textContent = label
+      console.log("Active master:", node)
     }
 
     // ---- Nav ----

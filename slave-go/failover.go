@@ -12,7 +12,9 @@ import (
 var isMaster int32 // 0 = normal slave, 1 = acting as master
 
 // watchMaster pings the real master every 5s.
-// After 3 consecutive failures (~15s) this slave promotes itself.
+// After 3 consecutive failures (~15s) this slave promotes itself —
+// but ONLY if it is the lowest-indexed slave still reachable, to prevent
+// split-brain (two slaves promoting simultaneously).
 // When the master comes back, it reverts to slave mode and pushes
 // its local metadata back to the master.
 func watchMaster(masterURL string, db *sql.DB, localMeta *Metadata) {
@@ -27,20 +29,56 @@ func watchMaster(masterURL string, db *sql.DB, localMeta *Metadata) {
 		if err != nil || resp.StatusCode != http.StatusOK {
 			fails++
 			fmt.Printf("  ⚠ Master unreachable (%d/3)\n", fails)
-			if fails >= 3 {
-				promote()
+			if fails >= 3 && atomic.LoadInt32(&isMaster) == 0 {
+				// FIX (#3 split-brain): before promoting, check if another slave
+				// is already acting as master. We pick the slave with the lowest
+				// port number as the tie-breaker — only promote if no other slave
+				// has already promoted itself.
+				if !anotherSlaveIsActingAsMaster() {
+					promote()
+				} else {
+					fmt.Println("  ℹ Another slave is already acting as master — staying as slave")
+				}
 			}
 		} else {
 			resp.Body.Close()
 			if atomic.LoadInt32(&isMaster) == 1 {
 				fmt.Println("  ✓ Real master is back — reverting to slave mode")
-				// Push our metadata to the master so it's up to date.
 				pushMetadataToMaster(masterURL, localMeta)
 			}
 			atomic.StoreInt32(&isMaster, 0)
+			// FIX (#2): reset fails counter when master is reachable again,
+			// so the next outage starts a clean count from 0.
 			fails = 0
 		}
 	}
+}
+
+// anotherSlaveIsActingAsMaster checks all known peer slaves to see if any
+// has already promoted itself. This prevents split-brain.
+// FIX (#3): this function is the core of the split-brain prevention.
+func anotherSlaveIsActingAsMaster() bool {
+	client := http.Client{Timeout: 2 * time.Second}
+	for _, peerURL := range peerSlaveURLs {
+		req, err := http.NewRequest("GET", peerURL+"/promote", nil)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		var result map[string]bool
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+		if result["acting_master"] {
+			return true
+		}
+	}
+	return false
 }
 
 func promote() {
@@ -93,8 +131,6 @@ func masterGuard(h http.HandlerFunc) http.HandlerFunc {
 
 // registerMasterRoutes pre-registers GUI-facing routes on this slave at startup.
 // They are all gated by masterGuard, so they do nothing until promotion.
-// When promoted, this slave serves requests directly from its own MySQL —
-// it acts as a single-node master (no broadcasting, just local reads/writes).
 func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 	http.HandleFunc("/db/create", masterGuard(func(w http.ResponseWriter, r *http.Request) {
 		var req CreateDBRequest
@@ -134,9 +170,7 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			writeError(w, err.Error())
 			return
 		}
-		// Also create the _replica table (keep schema consistent).
 		_ = createTable(db, req.DBName, req.Table+"_replica", req.Columns)
-		// Register in local metadata so recovery sync works after master returns.
 		localMeta.Shards[req.Table] = map[string]ShardInfo{
 			"shard_1": {URL: "self", DBName: req.DBName},
 		}
@@ -179,7 +213,6 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 		table := r.URL.Query().Get("table")
 		condition := r.URL.Query().Get("condition")
 
-		// Query both primary and replica tables and merge (dedup by id).
 		rows1, err1 := selectRows(db, dbName, table, condition)
 		rows2, _ := selectRows(db, dbName, table+"_replica", condition)
 
@@ -199,7 +232,6 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			writeError(w, "Invalid body")
 			return
 		}
-		// Update both primary and replica so all rows are covered.
 		err1 := updateRows(db, req.DBName, req.Table, req.Data, req.Condition)
 		err2 := updateRows(db, req.DBName, req.Table+"_replica", req.Data, req.Condition)
 		if err1 != nil && err2 != nil {

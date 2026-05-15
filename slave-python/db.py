@@ -1,5 +1,7 @@
 import mysql.connector
 from mysql.connector import Error
+import datetime
+import decimal
 
 
 def get_connection(dsn: str):
@@ -18,6 +20,21 @@ def get_connection(dsn: str):
         password=password,
         autocommit=True
     )
+
+
+def _serialize(value):
+    """
+    FIX (#7): MySQL Python connector returns types that are not JSON
+    serializable: datetime.date, datetime.datetime, decimal.Decimal, bytes.
+    Convert them to plain Python types so Flask's jsonify never crashes.
+    """
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def create_database(conn, db_name: str):
@@ -73,7 +90,10 @@ def select_rows(conn, db_name: str, table: str, condition: str) -> list[dict]:
     cursor.execute(query)
     rows = cursor.fetchall()
     cursor.close()
-    return rows
+
+    # FIX (#7): apply _serialize to every value so the result is always
+    # JSON-safe regardless of column type (DATE, FLOAT, BLOB, etc.).
+    return [{k: _serialize(v) for k, v in row.items()} for row in rows]
 
 
 def update_rows(conn, db_name: str, table: str, data: dict, condition: str):

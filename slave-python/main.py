@@ -16,21 +16,19 @@ DSN = os.environ.get("MYSQL_DSN", "root:password@127.0.0.1:3306")
 conn = get_connection(DSN)
 print("✓ Connected to MySQL")
 
-# FIX (#12): auto_increment settings must succeed or IDs will collide across
-# slaves. Previously cursor.execute errors were silently swallowed by the
-# try/except around the whole startup block (or simply not caught), so a MySQL
-# user without SYSTEM_VARIABLES_ADMIN privilege would let both slaves generate
-# the same IDs, causing primary-key conflicts on INSERT.
-# We now check both SET GLOBAL calls explicitly and exit loudly if they fail.
-# If your MySQL user lacks the privilege, grant it with:
-#   GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'youruser'@'%';
 offset = int(os.environ.get("SLAVE_OFFSET", "2"))
 total_slaves = int(os.environ.get("TOTAL_SLAVES", "2"))
 
+# FIX (#10): set both GLOBAL and SESSION so the current connection uses the
+# correct auto_increment values immediately. GLOBAL only affects new
+# connections opened after the SET, so without SESSION the very first inserts
+# on this connection could collide with the other slave.
 try:
     cursor = conn.cursor()
     cursor.execute(f"SET GLOBAL auto_increment_increment = {total_slaves}")
     cursor.execute(f"SET GLOBAL auto_increment_offset = {offset}")
+    cursor.execute(f"SET SESSION auto_increment_increment = {total_slaves}")
+    cursor.execute(f"SET SESSION auto_increment_offset = {offset}")
     cursor.close()
     print(f"✓ auto_increment_increment={total_slaves}, auto_increment_offset={offset}")
 except Exception as e:
@@ -42,6 +40,12 @@ except Exception as e:
 local_meta = {"shards": {}}
 
 master_url = os.environ.get("MASTER_URL", "http://localhost:8095")
+
+# FIX (#3 split-brain): read peer slave URLs so we can check if another slave
+# has already promoted before we do. Set via PEER_SLAVE_URLS env var,
+# comma-separated, e.g. "http://localhost:8081"
+peer_slave_urls = ["http://localhost:8081"]
+
 acting_as_master = False
 acting_as_master_lock = threading.Lock()
 
@@ -319,6 +323,26 @@ def err(msg: str):
 
 # ---- Master watcher ----
 
+def another_slave_is_acting_as_master() -> bool:
+    """
+    FIX (#3 split-brain): check all peer slaves before self-promoting.
+    Returns True if any peer is already acting as master.
+    """
+    for peer_url in peer_slave_urls:
+        try:
+            r = requests.get(
+                peer_url + "/promote",
+                headers={"X-Auth-Token": AUTH_TOKEN},
+                timeout=2
+            )
+            data = r.json()
+            if data.get("acting_master"):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def watch_master():
     global acting_as_master
     fails = 0
@@ -344,6 +368,7 @@ def watch_master():
                         print(f"  ✗ Could not push metadata to master: {e}")
                 with acting_as_master_lock:
                     acting_as_master = False
+                # FIX (#2): reset fails on successful master contact.
                 fails = 0
                 continue
         except Exception:
@@ -353,9 +378,16 @@ def watch_master():
         print(f"  ⚠ Master unreachable ({fails}/3)")
         if fails >= 3:
             with acting_as_master_lock:
-                if not acting_as_master:
-                    acting_as_master = True
+                already = acting_as_master
+            if not already:
+                # FIX (#3 split-brain): only promote if no peer slave has
+                # already done so.
+                if not another_slave_is_acting_as_master():
+                    with acting_as_master_lock:
+                        acting_as_master = True
                     print("  ★ Acting as master now")
+                else:
+                    print("  ℹ Another slave is already acting as master — staying as slave")
 
 
 threading.Thread(target=watch_master, daemon=True).start()

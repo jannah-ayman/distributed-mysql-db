@@ -29,9 +29,12 @@ func loadMetadata() *Metadata {
 }
 
 // saveMetadata persists current metadata to disk.
+// FIX (#5): was using RLock which allowed concurrent writers to modify m.Shards
+// while this goroutine was marshaling it, causing a race. Use Lock to ensure
+// the struct is not modified during the marshal.
 func saveMetadata(m *Metadata) {
-	metaMu.RLock()
-	defer metaMu.RUnlock()
+	metaMu.Lock()
+	defer metaMu.Unlock()
 
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
@@ -45,14 +48,6 @@ func saveMetadata(m *Metadata) {
 }
 
 // registerTable records which slaves hold a table and stores the DB name.
-//
-// FIX (sharding mismatch + missing DBName): The old code split a 1–1000 ID
-// range across slaves, but inserts use round-robin and MySQL auto_increment
-// assigns IDs by parity. The shard map is now only used to store the DB name
-// and slave list — ID-based routing uses parity directly (see router.go).
-//
-// FIX (DBName): dbName is now stored in every ShardInfo so recovery sync
-// knows which database a table belongs to without a separate lookup.
 func registerTable(m *Metadata, table, dbName string, onlineSlaves []string) {
 	metaMu.Lock()
 	defer metaMu.Unlock()

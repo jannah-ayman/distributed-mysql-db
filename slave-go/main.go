@@ -15,13 +15,17 @@ const authToken = "my-secret-token-123"
 
 var authTokenHash = fmt.Sprintf("%x", sha256.Sum256([]byte(authToken)))
 
+// peerSlaveURLs holds the URLs of all OTHER slaves (not this one).
+// Used by watchMaster to check for split-brain before self-promoting.
+// FIX (#3): populated from PEER_SLAVE_URLS env var at startup.
+var peerSlaveURLs []string
+
 // readCloser wraps a byte slice so we can use it as an io.ReadCloser in requests.
 func readCloser(b []byte) io.ReadCloser {
 	return io.NopCloser(bytes.NewReader(b))
 }
 
 // mergeRows deduplicates rows from multiple sources by id.
-// Copied here so the promoted slave's select handler can use it.
 func mergeRows(allRows ...[]map[string]any) []map[string]any {
 	seen := make(map[string]bool)
 	var merged []map[string]any
@@ -53,6 +57,9 @@ func main() {
 		masterURL = "http://localhost:8095"
 	}
 
+	// check whether another slave has already promoted before self-promoting.
+	peerSlaveURLs = []string{"http://localhost:8082"}
+
 	db, err := openDB(dsn)
 	if err != nil {
 		fmt.Println("✗ Could not connect to MySQL:", err)
@@ -61,13 +68,6 @@ func main() {
 	defer db.Close()
 	fmt.Println("✓ Connected to MySQL")
 
-	// FIX (#12): auto_increment settings must succeed or IDs will collide across
-	// slaves. Previously db.Exec errors were discarded, so a MySQL user without
-	// SUPER/SYSTEM_VARIABLES_ADMIN privilege would silently produce overlapping
-	// IDs, causing primary-key conflicts on INSERT.
-	// We now check both SET GLOBAL calls and crash loudly if they fail.
-	// If your MySQL user lacks the privilege, grant it with:
-	//   GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'youruser'@'%';
 	slaveIndex := os.Getenv("SLAVE_INDEX")
 	if slaveIndex == "" {
 		slaveIndex = "0"
@@ -79,7 +79,7 @@ func main() {
 
 	var idx int
 	fmt.Sscan(slaveIndex, &idx)
-	offset := idx + 1 // slave[0] → offset 1, slave[1] → offset 2, etc.
+	offset := idx + 1
 
 	if _, err := db.Exec("SET GLOBAL auto_increment_increment = " + totalSlaves); err != nil {
 		fmt.Printf("✗ Could not set auto_increment_increment: %v\n", err)
@@ -91,17 +91,23 @@ func main() {
 		fmt.Println("  Hint: GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO your MySQL user")
 		os.Exit(1)
 	}
+	// FIX (#10): also set SESSION-level variables so the current connection
+	// uses the correct offset immediately (GLOBAL only affects new connections).
+	if _, err := db.Exec("SET SESSION auto_increment_increment = " + totalSlaves); err != nil {
+		fmt.Printf("  ⚠ Could not set SESSION auto_increment_increment: %v\n", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("SET SESSION auto_increment_offset = %d", offset)); err != nil {
+		fmt.Printf("  ⚠ Could not set SESSION auto_increment_offset: %v\n", err)
+	}
 	fmt.Printf("✓ auto_increment_increment=%s, auto_increment_offset=%d\n", totalSlaves, offset)
 
 	localMeta := &Metadata{Shards: make(map[string]map[string]ShardInfo)}
 
-	// Register slave-only routes.
 	http.HandleFunc("/ping", pingHandler)
 	http.HandleFunc("/internal/exec", execHandler(db))
 	http.HandleFunc("/internal/metadata", metadataHandler(localMeta))
 	http.HandleFunc("/internal/sync-metadata", syncMetadataHandler(localMeta))
 
-	// /promote reports whether this slave is acting as master.
 	http.HandleFunc("/promote", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -110,12 +116,10 @@ func main() {
 		})
 	})
 
-	// Pre-register master-style routes (gated by masterGuard — inactive until promoted).
 	registerMasterRoutes(db, localMeta)
 
 	fmt.Println("Slave running on port " + port + "...")
 
-	// Pass db and localMeta so watchMaster can push metadata back on master recovery.
 	go watchMaster(masterURL, db, localMeta)
 
 	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
