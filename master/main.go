@@ -64,7 +64,7 @@ func main() {
 	}
 
 	// --- Start heartbeat every 5 seconds ---
-	startHeartbeat(allSlaves, state, 5*time.Second)
+	startHeartbeat(allSlaves, state, meta, 5*time.Second)
 
 	// --- Serve GUI ---
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -217,7 +218,7 @@ func sendExec(client http.Client, url string, req ExecRequest) error {
 		return err
 	}
 	if !execResp.Success {
-		return fmt.Errorf(execResp.Error)
+		return errors.New(execResp.Error)
 	}
 	return nil
 }

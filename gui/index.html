@@ -602,8 +602,10 @@
           <label>table name</label>
           <input type="text" id="ins-table" placeholder="students" />
         </div>
-        <button class="btn" onclick="loadInsertFields()" style="margin-bottom:12px">load fields</button>
-        <div id="ins-fields"></div>
+        <div class="field">
+          <label>data (JSON)</label>
+          <textarea id="ins-data" placeholder='{"name": "Alice", "age": 20}'></textarea>
+        </div>
         <button class="btn primary" onclick="insertRow()">insert</button>
         <div class="log" id="log-ins">—</div>
       </div>
@@ -621,8 +623,10 @@
           <label>table name</label>
           <input type="text" id="upd-table" placeholder="students" />
         </div>
-        <button class="btn" onclick="loadUpdateFields()" style="margin-bottom:12px">load fields</button>
-        <div id="upd-fields"></div>
+        <div class="field">
+          <label>data (JSON)</label>
+          <textarea id="upd-data" placeholder='{"name": "Bob"}'></textarea>
+        </div>
         <div class="field">
           <label>condition <span style="color:var(--muted);font-size:10px">(WHERE clause — leave blank to update
               all)</span></label>

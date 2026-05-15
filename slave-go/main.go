@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync/atomic"
 )
 
 const authToken = "my-secret-token-123"
@@ -47,8 +48,17 @@ func main() {
 	http.HandleFunc("/internal/exec", execHandler(db))
 	http.HandleFunc("/internal/metadata", metadataHandler(localMeta))
 	http.HandleFunc("/internal/sync-metadata", syncMetadataHandler(localMeta))
-
+	http.HandleFunc("/promote", func(w http.ResponseWriter, r *http.Request) {
+		if atomic.LoadInt32(&isMaster) == 1 {
+			w.Write([]byte(`{"acting_master":true}`))
+		} else {
+			w.Write([]byte(`{"acting_master":false}`))
+		}
+	})
 	fmt.Println("Slave (Go) running on port " + port + "...")
+
+	masterURL := "http://localhost:8095"
+	go watchMaster(masterURL, localMeta)
 
 	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 		fmt.Println("✗ Server error:", err)

@@ -1,6 +1,4 @@
-import os
-import json
-import hashlib
+import os, json, hashlib, threading, time, requests
 from flask import Flask, request, jsonify
 from db import (
     get_connection, create_database, drop_database,
@@ -144,7 +142,30 @@ def ok(rows=None):
 def err(msg: str):
     return jsonify({"success": False, "error": msg}), 500
 
+master_url = os.environ.get("MASTER_URL", "http://localhost:8095")
+acting_as_master = False
 
+def watch_master():
+    global acting_as_master
+    fails = 0
+    while True:
+        time.sleep(5)
+        try:
+            r = requests.get(master_url + "/health",
+                             headers={"X-Auth-Token": AUTH_TOKEN}, timeout=3)
+            if r.status_code == 200:
+                fails = 0
+                acting_as_master = False
+                continue
+        except Exception:
+            pass
+        fails += 1
+        print(f"  ⚠ Master unreachable ({fails}/3)")
+        if fails >= 3 and not acting_as_master:
+            acting_as_master = True
+            print("  ★ Acting as master now")
+
+threading.Thread(target=watch_master, daemon=True).start()
 # ---- Start ----
 
 if __name__ == "__main__":
