@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Distributed DB</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&display=swap"
+    rel="stylesheet" />
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #181c26;
+      --surface2: #1e2333;
+      --border: #2a3044;
+      --accent: #4f8ef7;
+      --accent2: #3dd68c;
+      --danger: #f76f6f;
+      --warning: #f7b84f;
+      --text: #e2e8f0;
+      --muted: #6b7a99;
+      --mono: 'IBM Plex Mono', monospace;
+      --sans: 'IBM Plex Sans', sans-serif;
+      --radius: 8px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      min-height: 100vh;
+      display: flex;
+    }
+
+    /* ---- Sidebar ---- */
+    .sidebar {
+      width: 220px;
+      min-height: 100vh;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .sidebar-logo {
+      padding: 20px 16px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .sidebar-logo span {
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--accent);
+      letter-spacing: 0.04em;
+    }
+
+    .sidebar-logo small {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    .nav-section {
+      padding: 12px 0 4px;
+    }
+
+    .nav-label {
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      padding: 0 16px 6px;
+      text-transform: uppercase;
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      cursor: pointer;
+      border-radius: 0;
+      transition: background 0.1s;
+      font-size: 13px;
+      color: var(--muted);
+      border: none;
+      background: none;
+      width: 100%;
+      text-align: left;
+    }
+
+    .nav-item:hover {
+      background: var(--surface2);
+      color: var(--text);
+    }
+
+    .nav-item.active {
+      background: var(--surface2);
+      color: var(--accent);
+    }
+
+    .nav-item .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--border);
+      flex-shrink: 0;
+    }
+
+    .nav-item.active .dot {
+      background: var(--accent);
+    }
+
+    /* ---- Health bar at bottom of sidebar ---- */
+    .health-bar {
+      margin-top: auto;
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .health-bar p {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 8px;
+      font-family: var(--mono);
+    }
+
+    .health-node {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    .health-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--border);
+      flex-shrink: 0;
+    }
+
+    .health-dot.online {
+      background: var(--accent2);
+    }
+
+    .health-dot.offline {
+      background: var(--danger);
+    }
+
+    /* ---- Main area ---- */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .topbar {
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--surface);
+    }
+
+    .topbar h1 {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text);
+      font-family: var(--mono);
+    }
+
+    .topbar-meta {
+      font-size: 11px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    /* ---- Panels ---- */
+    .panel {
+      display: none;
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+    }
+
+    .panel.active {
+      display: block;
+    }
+
+    /* ---- Form cards ---- */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+      max-width: 600px;
+    }
+
+    .card h2 {
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 16px;
+      font-family: var(--mono);
+    }
+
+    /* ---- Inputs ---- */
+    .field {
+      margin-bottom: 12px;
+    }
+
+    .field label {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 4px;
+      font-family: var(--mono);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    input[type="text"],
+    textarea,
+    select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      padding: 8px 10px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    input[type="text"]:focus,
+    textarea:focus,
+    select:focus {
+      border-color: var(--accent);
+    }
+
+    textarea {
+      resize: vertical;
+      min-height: 80px;
+    }
+
+    select option {
+      background: var(--surface2);
+    }
+
+    /* ---- Buttons ---- */
+    .btn {
+      padding: 8px 16px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .btn:hover {
+      background: var(--border);
+    }
+
+    .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    .btn.primary:hover {
+      opacity: 0.85;
+    }
+
+    .btn.danger {
+      background: var(--danger);
+      border-color: var(--danger);
+      color: #fff;
+    }
+
+    .btn.danger:hover {
+      opacity: 0.85;
+    }
+
+    /* ---- Response log ---- */
+    .log {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+      min-height: 48px;
+      max-height: 200px;
+      overflow-y: auto;
+      margin-top: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .log .ok {
+      color: var(--accent2);
+    }
+
+    .log .err {
+      color: var(--danger);
+    }
+
+    .log .info {
+      color: var(--accent);
+    }
+
+    /* ---- Results table ---- */
+    .result-wrap {
+      overflow-x: auto;
+      margin-top: 16px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    thead th {
+      background: var(--surface2);
+      color: var(--muted);
+      padding: 8px 12px;
+      text-align: left;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+    }
+
+    tbody tr:hover {
+      background: var(--surface2);
+    }
+
+    tbody td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    /* ---- Columns builder ---- */
+    .col-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 6px;
+      align-items: center;
+    }
+
+    .col-row input {
+      flex: 1;
+    }
+
+    .col-row select {
+      width: 140px;
+      flex-shrink: 0;
+    }
+
+    .col-row .btn {
+      flex-shrink: 0;
+      padding: 7px 10px;
+    }
+
+    .add-col-btn {
+      font-size: 12px;
+      color: var(--accent);
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-family: var(--mono);
+      padding: 0;
+      margin-top: 4px;
+    }
+
+    .add-col-btn:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+
+<body>
+
+  <!-- ====== SIDEBAR ====== -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <span>distrib-db</span>
+      <small>master @ :8095</small>
+    </div>
+
+    <nav>
+      <div class="nav-section">
+        <p class="nav-label">Database</p>
+        <button class="nav-item active" data-panel="db">
+          <span class="dot"></span> manage db
+        </button>
+      </div>
+      <div class="nav-section">
+        <p class="nav-label">Tables</p>
+        <button class="nav-item" data-panel="create-table">
+          <span class="dot"></span> create table
+        </button>
+        <button class="nav-item" data-panel="drop-table">
+          <span class="dot"></span> drop table
+        </button>
+      </div>
+      <div class="nav-section">
+        <p class="nav-label">Data</p>
+        <button class="nav-item" data-panel="select">
+          <span class="dot"></span> select
+        </button>
+        <button class="nav-item" data-panel="insert">
+          <span class="dot"></span> insert
+        </button>
+        <button class="nav-item" data-panel="update">
+          <span class="dot"></span> update
+        </button>
+        <button class="nav-item" data-panel="delete">
+          <span class="dot"></span> delete
+        </button>
+      </div>
+    </nav>
+
+    <div class="health-bar">
+      <p>cluster health</p>
+      <div class="health-node">
+        <div class="health-dot online" id="h-master"></div>
+        master
+      </div>
+      <div class="health-node">
+        <div class="health-dot" id="h-slave1"></div>
+        slave-go
+      </div>
+      <div class="health-node">
+        <div class="health-dot" id="h-slave2"></div>
+        slave-py
+      </div>
+    </div>
+  </aside>
+
+  <!-- ====== MAIN ====== -->
+  <main class="main">
+    <div class="topbar">
+      <h1 id="panel-title">manage db</h1>
+      <span class="topbar-meta" id="topbar-meta">distributed database system</span>
+    </div>
+
+    <!-- DB panel -->
+    <section class="panel active" id="panel-db">
+      <div class="card">
+        <h2>create database</h2>
+        <div class="field">
+          <label>database name</label>
+          <input type="text" id="create-db-name" placeholder="university_db" />
+        </div>
+        <button class="btn primary" onclick="createDB()">create</button>
+        <div class="log" id="log-create-db">—</div>
+      </div>
+
+      <div class="card">
+        <h2>drop database</h2>
+        <div class="field">
+          <label>database name</label>
+          <input type="text" id="drop-db-name" placeholder="university_db" />
+        </div>
+        <button class="btn danger" onclick="dropDB()">drop</button>
+        <div class="log" id="log-drop-db">—</div>
+      </div>
+    </section>
+
+    <!-- Create table panel -->
+    <section class="panel" id="panel-create-table">
+      <div class="card" style="max-width:700px">
+        <h2>create table</h2>
+        <div class="field">
+          <label>database name</label>
+          <input type="text" id="ct-db" placeholder="university_db" />
+        </div>
+        <div class="field">
+          <label>table name</label>
+          <input type="text" id="ct-table" placeholder="students" />
+        </div>
+        <div class="field">
+          <label>columns <span style="color:var(--muted);font-size:10px">(id is auto-added)</span></label>
+          <div id="ct-cols">
+            <div class="col-row">
+              <input type="text" placeholder="column name" />
+              <select>
+                <option>VARCHAR(100)</option>
+                <option>INT</option>
+                <option>FLOAT</option>
+                <option>TEXT</option>
+                <option>DATE</option>
+                <option>BOOLEAN</option>
+              </select>
+              <button class="btn" onclick="removeColRow(this)">✕</button>
+            </div>
+          </div>
+          <button class="add-col-btn" onclick="addColRow()">+ add column</button>
+        </div>
+        <button class="btn primary" onclick="createTable()">create table</button>
+        <div class="log" id="log-ct">—</div>
+      </div>
+    </section>
+
+    <!-- Drop table panel -->
+    <section class="panel" id="panel-drop-table">
+      <div class="card">
+        <h2>drop table</h2>
+        <div class="field">
+          <label>database name</label>
+          <input type="text" id="dt-db" placeholder="university_db" />
+        </div>
+        <div class="field">
+          <label>table name</label>
+          <input type="text" id="dt-table" placeholder="students" />
+        </div>
+        <button class="btn danger" onclick="dropTable()">drop table</button>
+        <div class="log" id="log-dt">—</div>
+      </div>
+    </section>
+
+    <!-- Select panel -->
+    <section class="panel" id="panel-select">
+      <div class="card" style="max-width:700px">
+        <h2>select rows</h2>
+        <div class="field">
+          <label>database name</label>
+          <input type="text" id="sel-db" placeholder="university_db" />
+        </div>
+        <div class="field">
+          <label>table name</label>
+          <input type="text" id="sel-table" placeholder="students" />
+        </div>
+        <div class="field">
+          <label>where <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+          <input type="text" id="sel-cond" placeholder='age > 20  or  id = 5  or  name = "Jannah"' />
+        </div>
+        <div style="display:flex;gap:12px">
+          <div class="field" style="flex:1">
+            <label>order by <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+            <input type="text" id="sel-order" placeholder='id DESC  or  name ASC' />
+          </div>
+          <div class="field" style="width:100px">
+            <label>limit <span style="color:var(--muted);font-size:10px">(optional)</span></label>
+            <input type="text" id="sel-limit" placeholder='50' />
+          </div>
+        </div>
+        <button class="btn primary" onclick="selectRows()">run select</button>
+      </div>
+      <div id="sel-result"></div>
+    </section>
+
+    <!-- Insert panel -->
+    <section class="panel" id="panel-insert">
+      <div class="card" style="max-width:700px">
+        <h2>insert row</h2>
+        <div class="field">
+          <label>database name</label>
+          <input type="text" id="ins-db" placeholder="university_db" />
+        </div>
+        <div class="field">
+          <label>table name</label>
+          <input type="text" id="ins-table" placeholder="students" />
+        </div>
+        <button class="btn" onclick="loadInsertFields()" style="margin-bottom:12px">load fields</button>
+        <div id="ins-fields"></div>
+        <button class="btn primary" onclick="insertRow()">insert</button>
+        <div class="log" id="log-ins">—</div>
+      </div>
+    </section>
+
+    <!-- Update panel -->
+    <section class="panel" id="panel-update">
+      <div class="card" style="max-width:700px">
+        <h2>update rows</h2>
+        <div class="field">
+          <label>database name</label>
+          <input type="text" id="upd-db" placeholder="university_db" />
+        </div>
+        <div class="field">
+          <label>table name</label>
+          <input type="text" id="upd-table" placeholder="students" />
+        </div>
+        <button class="btn" onclick="loadUpdateFields()" style="margin-bottom:12px">load fields</button>
+        <div id="upd-fields"></div>
+        <div class="field">
+          <label>condition <span style="color:var(--muted);font-size:10px">(WHERE clause — leave blank to update
+              all)</span></label>
+          <input type="text" id="upd-cond" placeholder='id = 3' />
+        </div>
+        <button class="btn primary" onclick="updateRows()">update</button>
+        <div class="log" id="log-upd">—</div>
+      </div>
+    </section>
+
+    <!-- Delete panel -->
+    <section class="panel" id="panel-delete">
+      <div class="card">
+        <h2>delete rows</h2>
+        <div class="field">
+          <label>database name</label>
+          <input type="text" id="del-db" placeholder="university_db" />
+        </div>
+        <div class="field">
+          <label>table name</label>
+          <input type="text" id="del-table" placeholder="students" />
+        </div>
+        <div class="field">
+          <label>condition <span style="color:var(--muted);font-size:10px">(WHERE clause)</span></label>
+          <input type="text" id="del-cond" placeholder='id = 3' />
+        </div>
+        <button class="btn danger" onclick="deleteRows()">delete</button>
+        <div class="log" id="log-del">—</div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    const MASTER = "http://localhost:8095"
+    const TOKEN = "my-secret-token-123"
+
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Auth-Token": TOKEN
+    }
+
+    // ---- Nav ----
+    document.querySelectorAll(".nav-item[data-panel]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".nav-item").forEach(b => b.classList.remove("active"))
+        document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"))
+        btn.classList.add("active")
+        document.getElementById("panel-" + btn.dataset.panel).classList.add("active")
+        document.getElementById("panel-title").textContent = btn.dataset.panel.replace("-", " ")
+      })
+    })
+
+    // ---- Health polling ----
+    async function pollHealth() {
+      try {
+        const r = await fetch(MASTER + "/health", { headers })
+        const d = await r.json()
+        document.getElementById("h-master").className = "health-dot online"
+        if (d.slaves) {
+          const s1 = document.getElementById("h-slave1")
+          const s2 = document.getElementById("h-slave2")
+          if (d.slaves[0]) s1.className = "health-dot " + (d.slaves[0].online ? "online" : "offline")
+          if (d.slaves[1]) s2.className = "health-dot " + (d.slaves[1].online ? "online" : "offline")
+        }
+      } catch {
+        document.getElementById("h-master").className = "health-dot offline"
+      }
+    }
+    pollHealth()
+    setInterval(pollHealth, 5000)
+
+    // ---- API helpers ----
+    async function api(method, path, body) {
+      const opts = { method, headers }
+      if (body) opts.body = JSON.stringify(body)
+      const r = await fetch(MASTER + path, opts)
+      return r.json()
+    }
+
+    function logResult(id, data) {
+      const el = document.getElementById(id)
+      if (!el) return
+      el.innerHTML = ""
+      if (data.success !== false) {
+        el.innerHTML = `<span class="ok">✓ ${data.message || "success"}</span>`
+      } else {
+        el.innerHTML = `<span class="err">✗ ${data.error || "unknown error"}</span>`
+      }
+    }
+
+    function logRaw(id, text, isErr) {
+      const el = document.getElementById(id)
+      if (!el) return
+      el.innerHTML = `<span class="${isErr ? "err" : "ok"}">${text}</span>`
+    }
+
+    // ---- DB ops ----
+    async function createDB() {
+      const name = document.getElementById("create-db-name").value.trim()
+      if (!name) return logRaw("log-create-db", "✗ enter a database name", true)
+      const d = await api("POST", "/db/create", { db_name: name })
+      logResult("log-create-db", d)
+    }
+
+    async function dropDB() {
+      const name = document.getElementById("drop-db-name").value.trim()
+      if (!name) return logRaw("log-drop-db", "✗ enter a database name", true)
+      if (!confirm(`drop database "${name}"?`)) return
+      const d = await api("DELETE", "/db/drop", { db_name: name })
+      logResult("log-drop-db", d)
+    }
+
+    // ---- Column builder ----
+    function addColRow() {
+      const wrap = document.getElementById("ct-cols")
+      const row = document.createElement("div")
+      row.className = "col-row"
+      row.innerHTML = `
+    <input type="text" placeholder="column name" />
+    <select>
+      <option>VARCHAR(100)</option>
+      <option>INT</option>
+      <option>FLOAT</option>
+      <option>TEXT</option>
+      <option>DATE</option>
+      <option>BOOLEAN</option>
+    </select>
+    <button class="btn" onclick="removeColRow(this)">✕</button>
+  `
+      wrap.appendChild(row)
+    }
+    function removeColRow(btn) {
+      const wrap = document.getElementById("ct-cols")
+      if (wrap.children.length > 1) btn.closest(".col-row").remove()
+    }
+
+    // ---- Table ops ----
+    async function createTable() {
+      const db = document.getElementById("ct-db").value.trim()
+      const table = document.getElementById("ct-table").value.trim()
+      if (!db || !table) return logRaw("log-ct", "✗ db name and table name required", true)
+
+      const columns = {}
+      document.querySelectorAll("#ct-cols .col-row").forEach(row => {
+        const name = row.querySelector("input").value.trim()
+        const type = row.querySelector("select").value
+        if (name) columns[name] = type
+      })
+
+      const d = await api("POST", "/tables/create", { db_name: db, table, columns })
+      logResult("log-ct", d)
+    }
+
+    async function dropTable() {
+      const db = document.getElementById("dt-db").value.trim()
+      const table = document.getElementById("dt-table").value.trim()
+      if (!db || !table) return logRaw("log-dt", "✗ db name and table name required", true)
+      if (!confirm(`drop table "${table}"?`)) return
+      const d = await api("DELETE", "/tables/drop", { db_name: db, table })
+      logResult("log-dt", d)
+    }
+
+    // ---- Data ops ----
+    async function selectRows() {
+      const db = document.getElementById("sel-db").value.trim()
+      const table = document.getElementById("sel-table").value.trim()
+      const cond = document.getElementById("sel-cond").value.trim()
+
+      const params = new URLSearchParams({ db_name: db, table })
+      if (cond) params.set("condition", cond)
+
+      const r = await fetch(`${MASTER}/tables/select?${params}`, { headers })
+      const d = await r.json()
+
+      const wrap = document.getElementById("sel-result")
+      if (!d.success) {
+        wrap.innerHTML = `<div class="log"><span class="err">✗ ${d.error}</span></div>`
+        return
+      }
+
+      const rows = d.rows || []
+      if (!rows.length) {
+        wrap.innerHTML = `<div class="log"><span class="info">no rows returned</span></div>`
+        return
+      }
+
+      const cols = Object.keys(rows[0])
+      wrap.innerHTML = `
+    <div class="result-wrap">
+      <table>
+        <thead><tr>${cols.map(c => `<th>${c}</th>`).join("")}</tr></thead>
+        <tbody>
+          ${rows.map(row =>
+        `<tr>${cols.map(c => `<td>${row[c] ?? ""}</td>`).join("")}</tr>`
+      ).join("")}
+        </tbody>
+      </table>
+    </div>
+    <p style="font-size:11px;color:var(--muted);margin-top:8px;font-family:var(--mono)">${rows.length} row(s)</p>
+  `
+    }
+
+    async function insertRow() {
+      const db = document.getElementById("ins-db").value.trim()
+      const table = document.getElementById("ins-table").value.trim()
+      let data
+      try { data = JSON.parse(document.getElementById("ins-data").value) }
+      catch { return logRaw("log-ins", "✗ invalid JSON", true) }
+
+      const d = await api("POST", "/tables/insert", { db_name: db, table, data })
+      logResult("log-ins", d)
+    }
+
+    async function updateRows() {
+      const db = document.getElementById("upd-db").value.trim()
+      const table = document.getElementById("upd-table").value.trim()
+      const cond = document.getElementById("upd-cond").value.trim()
+      let data
+      try { data = JSON.parse(document.getElementById("upd-data").value) }
+      catch { return logRaw("log-upd", "✗ invalid JSON", true) }
+
+      const d = await api("PUT", "/tables/update", { db_name: db, table, data, condition: cond })
+      logResult("log-upd", d)
+    }
+
+    async function deleteRows() {
+      const db = document.getElementById("del-db").value.trim()
+      const table = document.getElementById("del-table").value.trim()
+      const cond = document.getElementById("del-cond").value.trim()
+      if (!confirm("delete rows?")) return
+
+      const d = await api("DELETE", "/tables/delete", { db_name: db, table, condition: cond })
+      logResult("log-del", d)
+    }
+  </script>
+</body>
+
+</html>
