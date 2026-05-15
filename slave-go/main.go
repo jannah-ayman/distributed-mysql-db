@@ -34,6 +34,8 @@ func main() {
 	}
 	defer db.Close()
 	fmt.Println("✓ Connected to MySQL")
+	db.Exec("SET GLOBAL auto_increment_increment = 2")
+	db.Exec("SET GLOBAL auto_increment_offset = 1")
 
 	// --- Local metadata copy (master will sync this) ---
 	localMeta := &Metadata{

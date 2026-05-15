@@ -17,7 +17,11 @@ app = Flask(__name__)
 DSN = os.environ.get("MYSQL_DSN", "root:password@127.0.0.1:3306")
 conn = get_connection(DSN)
 print("✓ Connected to MySQL")
-
+offset = 2
+cursor = conn.cursor()
+cursor.execute("SET SESSION auto_increment_increment = 2")
+cursor.execute(f"SET SESSION auto_increment_offset = {offset}")
+cursor.close()
 # --- Local metadata copy (master will sync this) ---
 local_meta = {"shards": {}}
 
