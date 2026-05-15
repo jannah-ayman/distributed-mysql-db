@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -12,6 +14,28 @@ import (
 const authToken = "my-secret-token-123"
 
 var authTokenHash = fmt.Sprintf("%x", sha256.Sum256([]byte(authToken)))
+
+// readCloser wraps a byte slice so we can use it as an io.ReadCloser in requests.
+func readCloser(b []byte) io.ReadCloser {
+	return io.NopCloser(bytes.NewReader(b))
+}
+
+// mergeRows deduplicates rows from multiple sources by id.
+// Copied here so the promoted slave's select handler can use it.
+func mergeRows(allRows ...[]map[string]any) []map[string]any {
+	seen := make(map[string]bool)
+	var merged []map[string]any
+	for _, rows := range allRows {
+		for _, row := range rows {
+			id := fmt.Sprintf("%v", row["id"])
+			if !seen[id] {
+				seen[id] = true
+				merged = append(merged, row)
+			}
+		}
+	}
+	return merged
+}
 
 func main() {
 	port := os.Getenv("PORT")
@@ -37,11 +61,7 @@ func main() {
 	defer db.Close()
 	fmt.Println("✓ Connected to MySQL")
 
-	// auto_increment settings — controlled by env so each slave gets a unique
-	// offset without hardcoding odd/even. With 2 slaves:
-	//   slave-go:  SLAVE_INDEX=0 → offset=1, increment=2 → IDs 1,3,5,…
-	//   slave-py:  SLAVE_INDEX=1 → offset=2, increment=2 → IDs 2,4,6,…
-	// Adding a third slave: SLAVE_INDEX=2 → offset=3, increment=3 on all.
+	// auto_increment settings so each slave gets unique IDs.
 	slaveIndex := os.Getenv("SLAVE_INDEX")
 	if slaveIndex == "" {
 		slaveIndex = "0"
@@ -59,13 +79,13 @@ func main() {
 
 	localMeta := &Metadata{Shards: make(map[string]map[string]ShardInfo)}
 
+	// Register slave-only routes.
 	http.HandleFunc("/ping", pingHandler)
 	http.HandleFunc("/internal/exec", execHandler(db))
 	http.HandleFunc("/internal/metadata", metadataHandler(localMeta))
 	http.HandleFunc("/internal/sync-metadata", syncMetadataHandler(localMeta))
 
 	// /promote reports whether this slave is acting as master.
-	// The GUI polls this on all known nodes to find the active master.
 	http.HandleFunc("/promote", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -74,8 +94,13 @@ func main() {
 		})
 	})
 
+	// Pre-register master-style routes (gated by masterGuard — inactive until promoted).
+	registerMasterRoutes(db, localMeta)
+
 	fmt.Println("Slave running on port " + port + "...")
-	go watchMaster(masterURL)
+
+	// Pass db and localMeta so watchMaster can push metadata back on master recovery.
+	go watchMaster(masterURL, db, localMeta)
 
 	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 		fmt.Println("✗ Server error:", err)

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -30,13 +32,85 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// fetchMetadataFromSlaves tries to pull metadata from any online slave.
+// Used on master restart so it picks up any schema changes that happened
+// while it was down (e.g. a slave was promoted and created a table).
+func fetchMetadataFromSlaves(slaves []string) *Metadata {
+	client := http.Client{Timeout: 5 * time.Second}
+	for _, url := range slaves {
+		req, err := http.NewRequest("GET", url+"/internal/metadata", nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("X-Auth-Token", authToken)
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		var m Metadata
+		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+		if len(m.Shards) > 0 {
+			fmt.Printf("  ✓ Pulled metadata from %s (%d tables)\n", url, len(m.Shards))
+			return &m
+		}
+	}
+	return nil
+}
+
+// readCloser is a small helper used in pushes (avoids import of bytes in other files).
+func readCloser(b []byte) *bytes.Reader {
+	return bytes.NewReader(b)
+}
+func slaveWasPromoted(slaves []string) bool {
+	client := http.Client{Timeout: 3 * time.Second}
+	for _, url := range slaves {
+		req, err := http.NewRequest("GET", url+"/promote", nil)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		var result map[string]bool
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if result["acting_master"] {
+			fmt.Printf("  ✓ %s was acting as master\n", url)
+			return true
+		}
+	}
+	return false
+}
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8095"
 	}
 
+	// Load metadata from disk first.
 	meta := loadMetadata()
+
+	// If disk metadata is empty, try to pull from a slave — the master may have
+	// crashed while a promoted slave handled requests and updated the schema.
+	fmt.Println("Checking if a slave was promoted while master was down...")
+	if slaveWasPromoted(allSlaves) {
+		fmt.Println("  A slave was acting as master — pulling its metadata...")
+		if pulled := fetchMetadataFromSlaves(allSlaves); pulled != nil {
+			for table, shards := range pulled.Shards {
+				if _, exists := meta.Shards[table]; !exists {
+					meta.Shards[table] = shards
+					fmt.Printf("  ✓ Learned about table %s from promoted slave\n", table)
+				}
+			}
+			saveMetadata(meta)
+		}
+	}
+
 	state := newSlaveState(allSlaves)
 
 	fmt.Println("Checking slaves...")
@@ -56,7 +130,6 @@ func main() {
 
 	startHeartbeat(allSlaves, state, meta, 5*time.Second)
 
-	// /ping lets the GUI discover which node is alive (same endpoint slaves expose)
 	http.HandleFunc("/ping", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -64,6 +137,33 @@ func main() {
 		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("pong"))
+	}))
+
+	// Also accept metadata pushes from a recovering slave.
+	http.HandleFunc("/internal/sync-metadata", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if !authenticate(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var incoming Metadata
+		if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		// Merge: keep any shards the master already knows about, add new ones.
+		for table, shards := range incoming.Shards {
+			if _, exists := meta.Shards[table]; !exists {
+				meta.Shards[table] = shards
+				fmt.Printf("  ✓ Master learned about table %s from slave push\n", table)
+			}
+		}
+		saveMetadata(meta)
+		w.WriteHeader(http.StatusOK)
+		fmt.Println("  ✓ Metadata received from recovering slave")
 	}))
 
 	http.HandleFunc("/db/create", corsMiddleware(handleCreateDB(allSlaves, state)))
