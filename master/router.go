@@ -2,17 +2,15 @@ package main
 
 import (
 	"fmt"
-	"strconv"
+	"strings"
 	"sync"
 )
 
 var insertCounter int
 var insertMu sync.Mutex
 
-// routeInsert uses round-robin to alternate inserts between slaves
+// routeInsert uses round-robin to alternate inserts between slaves.
 func routeInsert(slaves []string, state *slaveState) (primary string, replica string, err error) {
-
-	// collect online slaves in order
 	var online []string
 	for _, url := range slaves {
 		if state.isOnline(url) {
@@ -24,7 +22,6 @@ func routeInsert(slaves []string, state *slaveState) (primary string, replica st
 		return "", "", fmt.Errorf("no online slaves available")
 	}
 
-	// round-robin: alternate which slave is primary each insert
 	insertMu.Lock()
 	idx := insertCounter % len(online)
 	insertCounter++
@@ -32,7 +29,6 @@ func routeInsert(slaves []string, state *slaveState) (primary string, replica st
 
 	primary = online[idx]
 
-	// replica = the other slave
 	for _, url := range online {
 		if url != primary {
 			replica = url
@@ -43,49 +39,48 @@ func routeInsert(slaves []string, state *slaveState) (primary string, replica st
 	return primary, replica, nil
 }
 
-// routeSelectByID returns the slave that owns a specific ID
-// falls back to replica slave if primary is offline
-func routeSelectByID(meta *Metadata, table string, id int, slaves []string, state *slaveState) (string, error) {
-
+// routeSelectByID returns the slave that owns a specific ID.
+// Falls back to the other slave's _replica table if the primary is offline.
+func routeSelectByID(meta *Metadata, table string, id int, slaves []string, state *slaveState) (string, bool, error) {
 	shard, ok := getShardForID(meta, table, id)
 	if !ok {
-		return "", fmt.Errorf("no shard found for table %s id %d", table, id)
+		// No shard metadata — fall back to full scan on any online slave.
+		for _, url := range slaves {
+			if state.isOnline(url) {
+				return url, false, nil
+			}
+		}
+		return "", false, fmt.Errorf("no shard found for table %s id %d and no slaves online", table, id)
 	}
 
-	// primary owner is online
+	// Primary owner is online — use it directly.
 	if state.isOnline(shard.URL) {
-		return shard.URL, nil
+		return shard.URL, false, nil
 	}
 
-	// primary is offline → use the other slave's replica
+	// Primary is offline — use the surviving slave's _replica table.
 	for _, url := range slaves {
 		if url != shard.URL && state.isOnline(url) {
-			fmt.Printf("  ⚠ Primary for id %d is offline, routing to replica at %s\n", id, url)
-			return url, nil
+			fmt.Printf("  ⚠ Primary for id %d is offline, routing SELECT to replica at %s\n", id, url)
+			return url, true, nil // true = useReplica
 		}
 	}
 
-	return "", fmt.Errorf("all slaves offline")
+	return "", false, fmt.Errorf("all slaves offline")
 }
 
 // routeSelectAll returns query targets for a full table scan.
-// - if all slaves are online: query each slave's primary table
-// - if a slave is offline: query the surviving slave's primary table AND
-//   its _replica table (which holds the offline slave's data), then merge
+//
+//   - All slaves online → each slave serves its own primary table.
+//   - A slave is offline → the surviving slave serves both its primary table
+//     AND its _replica table (which holds the offline slave's data).
+//
+// FIX (issue 1): previously this function always set useReplica=false,
+// so the offline slave's rows were never retrieved.
 func routeSelectAll(slaves []string, state *slaveState) []selectTarget {
-	type onlineInfo struct {
-		url    string
-		online bool
-	}
-
-	info := make([]onlineInfo, len(slaves))
-	for i, url := range slaves {
-		info[i] = onlineInfo{url: url, online: state.isOnline(url)}
-	}
-
 	allOnline := true
-	for _, s := range info {
-		if !s.online {
+	for _, url := range slaves {
+		if !state.isOnline(url) {
 			allOnline = false
 			break
 		}
@@ -94,38 +89,36 @@ func routeSelectAll(slaves []string, state *slaveState) []selectTarget {
 	var targets []selectTarget
 
 	if allOnline {
-		// normal case: each slave serves its own primary table
-		for _, s := range info {
-			targets = append(targets, selectTarget{url: s.url, useReplica: false})
+		for _, url := range slaves {
+			targets = append(targets, selectTarget{url: url, useReplica: false})
 		}
 		return targets
 	}
 
-	// at least one slave is offline
-	// surviving slave serves both its primary AND the replica of the dead slave
-	for _, s := range info {
-		if s.online {
-			targets = append(targets, selectTarget{url: s.url, useReplica: false})
-			targets = append(targets, selectTarget{url: s.url, useReplica: true})
+	// At least one slave is offline.
+	// Surviving slaves serve both primary and replica tables.
+	for _, url := range slaves {
+		if state.isOnline(url) {
+			targets = append(targets, selectTarget{url: url, useReplica: false})
+			targets = append(targets, selectTarget{url: url, useReplica: true})
 		}
 	}
 	return targets
 }
 
-// selectTarget describes one query to send during a full table scan
+// selectTarget describes one query to send during a full table scan.
 type selectTarget struct {
 	url        string
-	useReplica bool // if true, query the _replica table instead of primary
+	useReplica bool
 }
 
-// mergeRows combines rows from multiple slaves, removing duplicates by id
+// mergeRows combines rows from multiple result sets, deduplicating by id.
 func mergeRows(allRows ...[]map[string]any) []map[string]any {
 	seen := make(map[string]bool)
 	var merged []map[string]any
 
 	for _, rows := range allRows {
 		for _, row := range rows {
-			// use id as dedup key
 			id := fmt.Sprintf("%v", row["id"])
 			if !seen[id] {
 				seen[id] = true
@@ -137,18 +130,19 @@ func mergeRows(allRows ...[]map[string]any) []map[string]any {
 	return merged
 }
 
-// extractIDFromCondition tries to parse a simple "id = N" condition
-// returns -1 if it can't parse it (meaning we need a full scan)
-func extractIDFromCondition(condition string) int {
+// extractIDFromCondition tries to parse a simple "id = N" or "id=N" condition.
+// Returns (id, true) on success, (0, false) otherwise.
+//
+// FIX (issue 6): previously returned -1 on failure and the call site checked
+// `> 0`, which would incorrectly skip id=0 (not a real MySQL id, but still
+// wrong) and would pass id=-1 through as a valid value after a bad parse.
+func extractIDFromCondition(condition string) (int, bool) {
+	// Normalise: remove spaces around '='
+	s := strings.ReplaceAll(condition, " ", "")
+
 	var id int
-	_, err := fmt.Sscanf(condition, "id = %d", &id)
-	if err == nil {
-		return id
+	if _, err := fmt.Sscanf(s, "id=%d", &id); err == nil {
+		return id, true
 	}
-	// try "id=N"
-	n, err := strconv.Atoi(condition)
-	if err == nil {
-		return n
-	}
-	return -1
+	return 0, false
 }
