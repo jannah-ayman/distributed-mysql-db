@@ -7,9 +7,18 @@ import (
 	"time"
 )
 
-var isMaster int32 // 0 = slave, 1 = acting as master
+var isMaster int32 // 0 = normal slave, 1 = acting as master
 
-func watchMaster(masterURL string, meta *Metadata) {
+// watchMaster pings the real master every 5 s. After 3 consecutive failures
+// (~15 s) this slave promotes itself by setting isMaster = 1.
+//
+// The slave doesn't try to re-register HTTP routes — the GUI discovers the
+// new master by polling /ping on each known node and switching to whichever
+// one responds. The slave's existing /internal/exec routes keep working
+// for any traffic that arrives; it just won't serve the GUI's /db/* or
+// /tables/* routes (those are master-only). For a uni project this is the
+// right trade-off: keep it simple, document the limitation.
+func watchMaster(masterURL string) {
 	client := http.Client{Timeout: 3 * time.Second}
 	fails := 0
 	for {
@@ -34,6 +43,5 @@ func watchMaster(masterURL string, meta *Metadata) {
 func promote() {
 	if atomic.CompareAndSwapInt32(&isMaster, 0, 1) {
 		fmt.Println("  ★ Master appears down — this slave is now acting as master")
-		// Register /promote so the GUI can be pointed here
 	}
 }

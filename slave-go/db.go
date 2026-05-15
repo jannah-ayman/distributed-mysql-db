@@ -83,7 +83,7 @@ func insertRow(db *sql.DB, dbName, table string, data map[string]any) error {
 	return err
 }
 
-// selectRows runs a SELECT on the given table with an optional WHERE condition
+// selectRows runs a SELECT on the given table with an optional WHERE condition,
 // returns rows as a slice of maps
 func selectRows(db *sql.DB, dbName, table, condition string) ([]map[string]any, error) {
 

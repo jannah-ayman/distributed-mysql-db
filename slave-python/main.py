@@ -17,8 +17,8 @@ conn = get_connection(DSN)
 print("✓ Connected to MySQL")
 offset = 2
 cursor = conn.cursor()
-cursor.execute("SET SESSION auto_increment_increment = 2")
-cursor.execute(f"SET SESSION auto_increment_offset = {offset}")
+cursor.execute("SET GLOBAL auto_increment_increment = 2")
+cursor.execute(f"SET GLOBAL auto_increment_offset = {offset}")
 cursor.close()
 # --- Local metadata copy (master will sync this) ---
 local_meta = {"shards": {}}
@@ -130,6 +130,11 @@ def sync_metadata():
     local_meta = request.get_json()
     print("  ✓ Metadata synced from master")
     return "ok", 200
+
+
+@app.route("/promote", methods=["GET"])
+def promote():
+    return jsonify({"acting_master": acting_as_master}), 200
 
 
 # ---- Response helpers ----

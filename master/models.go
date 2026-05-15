@@ -68,13 +68,11 @@ type ExecResponse struct {
 
 // ---- Shard metadata ----
 
-// FIX (issue 2 / recovery): DBName added so recovery sync knows which
-// database a table belongs to without needing a separate lookup.
+// ShardInfo no longer stores ID ranges (Min/Max) since routing uses ID parity.
+// DBName is stored so recovery sync knows which database the table lives in.
 type ShardInfo struct {
 	URL    string `json:"url"`
-	Min    int    `json:"min"`
-	Max    int    `json:"max"`
-	DBName string `json:"db_name,omitempty"` // ← NEW
+	DBName string `json:"db_name,omitempty"`
 }
 
 type Metadata struct {

@@ -575,16 +575,6 @@
           <label>where <span style="color:var(--muted);font-size:10px">(optional)</span></label>
           <input type="text" id="sel-cond" placeholder='age > 20  or  id = 5  or  name = "Jannah"' />
         </div>
-        <div style="display:flex;gap:12px">
-          <div class="field" style="flex:1">
-            <label>order by <span style="color:var(--muted);font-size:10px">(optional)</span></label>
-            <input type="text" id="sel-order" placeholder='id DESC  or  name ASC' />
-          </div>
-          <div class="field" style="width:100px">
-            <label>limit <span style="color:var(--muted);font-size:10px">(optional)</span></label>
-            <input type="text" id="sel-limit" placeholder='50' />
-          </div>
-        </div>
         <button class="btn primary" onclick="selectRows()">run select</button>
       </div>
       <div id="sel-result"></div>
@@ -661,12 +651,46 @@
   </main>
 
   <script>
-    const MASTER = "http://localhost:8095"
     const TOKEN = "my-secret-token-123"
+
+    // All cluster nodes the GUI knows about, in priority order.
+    // Real master first, then slaves (which may be promoted).
+    const KNOWN_NODES = [
+      "http://localhost:8095",
+      "http://localhost:8081",
+      "http://localhost:8082"
+    ]
 
     const headers = {
       "Content-Type": "application/json",
       "X-Auth-Token": TOKEN
+    }
+
+    // The node the GUI is currently talking to.
+    let activeMaster = KNOWN_NODES[0]
+
+    // ---- Master discovery ----
+    // Try each known node's /ping. The real master always responds on :8095.
+    // If it's down, a promoted slave will also respond on its port.
+    // We don't need a special /master-url endpoint — just find whoever is alive
+    // and that's who we talk to.
+    async function discoverMaster() {
+      for (const node of KNOWN_NODES) {
+        try {
+          const r = await fetch(node + "/ping", {
+            headers,
+            signal: AbortSignal.timeout(2000)
+          })
+          if (r.ok) {
+            activeMaster = node
+            document.querySelector(".sidebar-logo small").textContent =
+              "master @ " + node.replace("http://", "")
+            console.log("Active master:", node)
+            return
+          }
+        } catch { /* unreachable, try next */ }
+      }
+      console.warn("No nodes reachable")
     }
 
     // ---- Nav ----
@@ -683,7 +707,10 @@
     // ---- Health polling ----
     async function pollHealth() {
       try {
-        const r = await fetch(MASTER + "/health", { headers })
+        const r = await fetch(activeMaster + "/health", {
+          headers,
+          signal: AbortSignal.timeout(3000)
+        })
         const d = await r.json()
         document.getElementById("h-master").className = "health-dot online"
         if (d.slaves) {
@@ -694,17 +721,26 @@
         }
       } catch {
         document.getElementById("h-master").className = "health-dot offline"
+        await discoverMaster()
       }
     }
-    pollHealth()
-    setInterval(pollHealth, 5000)
+
+    discoverMaster().then(() => {
+      pollHealth()
+      setInterval(pollHealth, 5000)
+    })
 
     // ---- API helpers ----
     async function api(method, path, body) {
       const opts = { method, headers }
       if (body) opts.body = JSON.stringify(body)
-      const r = await fetch(MASTER + path, opts)
-      return r.json()
+      try {
+        const r = await fetch(activeMaster + path, opts)
+        return r.json()
+      } catch {
+        await discoverMaster()
+        return { success: false, error: "Master unreachable — a failover may be in progress, please retry" }
+      }
     }
 
     function logResult(id, data) {
@@ -799,7 +835,7 @@
       const params = new URLSearchParams({ db_name: db, table })
       if (cond) params.set("condition", cond)
 
-      const r = await fetch(`${MASTER}/tables/select?${params}`, { headers })
+      const r = await fetch(`${activeMaster}/tables/select?${params}`, { headers })
       const d = await r.json()
 
       const wrap = document.getElementById("sel-result")

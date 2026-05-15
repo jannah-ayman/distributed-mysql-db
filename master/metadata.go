@@ -44,53 +44,32 @@ func saveMetadata(m *Metadata) {
 	}
 }
 
-// registerTable adds shard info for a new table, splitting the ID range
-// (1..1000) evenly across however many slaves are online.
-func registerTable(m *Metadata, table string, onlineSlaves []string) {
+// registerTable records which slaves hold a table and stores the DB name.
+//
+// FIX (sharding mismatch + missing DBName): The old code split a 1–1000 ID
+// range across slaves, but inserts use round-robin and MySQL auto_increment
+// assigns IDs by parity. The shard map is now only used to store the DB name
+// and slave list — ID-based routing uses parity directly (see router.go).
+//
+// FIX (DBName): dbName is now stored in every ShardInfo so recovery sync
+// knows which database a table belongs to without a separate lookup.
+func registerTable(m *Metadata, table, dbName string, onlineSlaves []string) {
 	metaMu.Lock()
 	defer metaMu.Unlock()
 
-	count := len(onlineSlaves)
-	rangeSize := 1000 / count
-
 	shards := make(map[string]ShardInfo)
 	for i, url := range onlineSlaves {
-		min := i*rangeSize + 1
-		max := (i + 1) * rangeSize
-		if i == count-1 {
-			max = 1000
-		}
 		shards[fmt.Sprintf("shard_%d", i+1)] = ShardInfo{
-			URL: url,
-			Min: min,
-			Max: max,
+			URL:    url,
+			DBName: dbName,
 		}
 	}
 
 	m.Shards[table] = shards
 }
 
-// getShardForID returns the shard that owns the given primary key ID.
-func getShardForID(m *Metadata, table string, id int) (ShardInfo, bool) {
-	metaMu.RLock()
-	defer metaMu.RUnlock()
-
-	shards, ok := m.Shards[table]
-	if !ok {
-		return ShardInfo{}, false
-	}
-
-	for _, shard := range shards {
-		if id >= shard.Min && id <= shard.Max {
-			return shard, true
-		}
-	}
-
-	return ShardInfo{}, false
-}
-
-// getAllShards returns all shards for a given table.
-func getAllShards(m *Metadata, table string) []ShardInfo {
+// getSlavesForTable returns the slave URLs registered for a table.
+func getSlavesForTable(m *Metadata, table string) []string {
 	metaMu.RLock()
 	defer metaMu.RUnlock()
 
@@ -98,12 +77,11 @@ func getAllShards(m *Metadata, table string) []ShardInfo {
 	if !ok {
 		return nil
 	}
-
-	result := make([]ShardInfo, 0, len(shards))
+	urls := make([]string, 0, len(shards))
 	for _, s := range shards {
-		result = append(result, s)
+		urls = append(urls, s.URL)
 	}
-	return result
+	return urls
 }
 
 // removeTable removes a table's shard info from metadata.
@@ -115,10 +93,6 @@ func removeTable(m *Metadata, table string) {
 
 // getAllTableNames returns a map of tableName → dbName for every table
 // registered in the metadata. Used by recovery sync.
-//
-// NOTE: metadata currently only stores shard info, not the db_name. We store
-// the db_name inside ShardInfo.DBName (added to models.go). If no DBName is
-// set (legacy metadata), we return an empty string and callers must handle it.
 func getAllTableNames(m *Metadata) map[string]string {
 	metaMu.RLock()
 	defer metaMu.RUnlock()

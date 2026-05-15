@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
@@ -43,6 +44,9 @@ func (s *slaveState) allStatuses() []SlaveStatus {
 	for url, online := range s.status {
 		result = append(result, SlaveStatus{URL: url, Online: online})
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].URL < result[j].URL
+	})
 	return result
 }
 
