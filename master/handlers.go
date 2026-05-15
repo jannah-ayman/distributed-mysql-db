@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// authenticate hashes the incoming token and compares against the stored hash
+// authenticate hashes the incoming token and compares against the stored hash.
 func authenticate(r *http.Request) bool {
 	incoming := r.Header.Get("X-Auth-Token")
 	incomingHash := fmt.Sprintf("%x", sha256.Sum256([]byte(incoming)))
@@ -19,7 +19,6 @@ func authenticate(r *http.Request) bool {
 
 func handleCreateDB(slaves []string, state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -40,8 +39,8 @@ func handleCreateDB(slaves []string, state *slaveState) http.HandlerFunc {
 			Operation: "CREATE_DB",
 		})
 
-		if len(errs) == len(slaves) {
-			writeError(w, "All slaves failed to create DB")
+		if len(errs) == countOnline(slaves, state) {
+			writeError(w, "All online slaves failed to create DB")
 			return
 		}
 
@@ -54,7 +53,6 @@ func handleCreateDB(slaves []string, state *slaveState) http.HandlerFunc {
 
 func handleDropDB(slaves []string, state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -75,8 +73,8 @@ func handleDropDB(slaves []string, state *slaveState) http.HandlerFunc {
 			Operation: "DROP_DB",
 		})
 
-		if len(errs) == len(slaves) {
-			writeError(w, "All slaves failed to drop DB")
+		if len(errs) == countOnline(slaves, state) {
+			writeError(w, "All online slaves failed to drop DB")
 			return
 		}
 
@@ -89,7 +87,6 @@ func handleDropDB(slaves []string, state *slaveState) http.HandlerFunc {
 
 func handleCreateTable(meta *Metadata, slaves []string, state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -112,18 +109,12 @@ func handleCreateTable(meta *Metadata, slaves []string, state *slaveState) http.
 			Columns:   req.Columns,
 		})
 
-		if len(errs) == len(slaves) {
-			writeError(w, "All slaves failed to create table")
+		if len(errs) == countOnline(slaves, state) {
+			writeError(w, "All online slaves failed to create table")
 			return
 		}
 
-		// register in metadata using only currently online slaves
-		onlineSlaves := []string{}
-		for _, url := range slaves {
-			if state.isOnline(url) {
-				onlineSlaves = append(onlineSlaves, url)
-			}
-		}
+		onlineSlaves := onlineList(slaves, state)
 		if len(onlineSlaves) > 0 {
 			registerTable(meta, req.Table, onlineSlaves)
 		}
@@ -139,7 +130,6 @@ func handleCreateTable(meta *Metadata, slaves []string, state *slaveState) http.
 
 func handleDropTable(meta *Metadata, slaves []string, state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -161,8 +151,8 @@ func handleDropTable(meta *Metadata, slaves []string, state *slaveState) http.Ha
 			Table:     req.Table,
 		})
 
-		if len(errs) == len(slaves) {
-			writeError(w, "All slaves failed to drop table")
+		if len(errs) == countOnline(slaves, state) {
+			writeError(w, "All online slaves failed to drop table")
 			return
 		}
 
@@ -179,7 +169,6 @@ func handleDropTable(meta *Metadata, slaves []string, state *slaveState) http.Ha
 
 func handleInsert(slaves []string, state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -201,7 +190,6 @@ func handleInsert(slaves []string, state *slaveState) http.HandlerFunc {
 			return
 		}
 
-		// send to primary
 		resp, err := sendToSlave(primaryURL, ExecRequest{
 			DBName:    req.DBName,
 			Operation: "INSERT",
@@ -218,7 +206,6 @@ func handleInsert(slaves []string, state *slaveState) http.HandlerFunc {
 			return
 		}
 
-		// send replica to the other slave (fire and forget in goroutine)
 		if replicaURL != "" {
 			go func() {
 				resp, err := sendToSlave(replicaURL, ExecRequest{
@@ -243,9 +230,11 @@ func handleInsert(slaves []string, state *slaveState) http.HandlerFunc {
 
 // ---- /tables/select ----
 
+// FIX (issue 1): routeSelectByID now returns a useReplica flag so that when
+// a slave is offline its rows are fetched from the surviving slave's _replica
+// table. routeSelectAll was also fixed in router.go.
 func handleSelect(meta *Metadata, slaves []string, state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -259,9 +248,9 @@ func handleSelect(meta *Metadata, slaves []string, state *slaveState) http.Handl
 		table := r.URL.Query().Get("table")
 		condition := r.URL.Query().Get("condition")
 
-		// if condition is "id = N", route to specific shard
-		if id := extractIDFromCondition(condition); id > 0 {
-			url, err := routeSelectByID(meta, table, id, slaves, state)
+		// Fast path: "id = N" — route to exactly one shard.
+		if id, ok := extractIDFromCondition(condition); ok {
+			url, useReplica, err := routeSelectByID(meta, table, id, slaves, state)
 			if err != nil {
 				writeError(w, err.Error())
 				return
@@ -271,6 +260,7 @@ func handleSelect(meta *Metadata, slaves []string, state *slaveState) http.Handl
 				Operation: "SELECT",
 				Table:     table,
 				Condition: condition,
+				IsReplica: useReplica,
 			})
 			if err != nil || !resp.Success {
 				writeError(w, "SELECT failed")
@@ -280,8 +270,7 @@ func handleSelect(meta *Metadata, slaves []string, state *slaveState) http.Handl
 			return
 		}
 
-		// full scan — query all online slaves in parallel, then merge
-		// routeSelectAll handles fallback to replica tables automatically
+		// Full scan — query all targets (primary + replicas when a slave is down).
 		targets := routeSelectAll(slaves, state)
 		if len(targets) == 0 {
 			writeError(w, "No slaves online")
@@ -312,7 +301,7 @@ func handleSelect(meta *Metadata, slaves []string, state *slaveState) http.Handl
 			}(t)
 		}
 
-		allRows := [][]map[string]any{}
+		var allRows [][]map[string]any
 		for range targets {
 			r := <-ch
 			if r.err == nil {
@@ -330,7 +319,6 @@ func handleSelect(meta *Metadata, slaves []string, state *slaveState) http.Handl
 
 func handleUpdate(slaves []string, state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -346,7 +334,6 @@ func handleUpdate(slaves []string, state *slaveState) http.HandlerFunc {
 			return
 		}
 
-		// update on all slaves (primary + replica tables) in parallel
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		var errs []string
@@ -359,7 +346,6 @@ func handleUpdate(slaves []string, state *slaveState) http.HandlerFunc {
 			go func(u string) {
 				defer wg.Done()
 
-				// update primary table
 				resp, err := sendToSlave(u, ExecRequest{
 					DBName:    req.DBName,
 					Operation: "UPDATE",
@@ -374,7 +360,6 @@ func handleUpdate(slaves []string, state *slaveState) http.HandlerFunc {
 					mu.Unlock()
 				}
 
-				// update replica table too
 				resp, err = sendToSlave(u, ExecRequest{
 					DBName:    req.DBName,
 					Operation: "UPDATE",
@@ -405,7 +390,6 @@ func handleUpdate(slaves []string, state *slaveState) http.HandlerFunc {
 
 func handleDelete(slaves []string, state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -421,7 +405,6 @@ func handleDelete(slaves []string, state *slaveState) http.HandlerFunc {
 			return
 		}
 
-		// delete from all slaves (primary + replica)
 		var wg sync.WaitGroup
 		for _, url := range slaves {
 			if !state.isOnline(url) {
@@ -457,12 +440,10 @@ func handleDelete(slaves []string, state *slaveState) http.HandlerFunc {
 
 func handleHealth(state *slaveState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(HealthResponse{
 			Master: "online",
@@ -471,7 +452,7 @@ func handleHealth(state *slaveState) http.HandlerFunc {
 	}
 }
 
-// ---- Response helpers ----
+// ---- helpers ----
 
 func writeSuccess(w http.ResponseWriter, message string, rows []map[string]any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -489,4 +470,28 @@ func writeError(w http.ResponseWriter, errMsg string) {
 		Success: false,
 		Error:   errMsg,
 	})
+}
+
+// countOnline returns the number of currently online slaves.
+// FIX (issue 10): used instead of len(slaves) to distinguish "all online
+// slaves failed" from "all slaves (including offline ones) failed".
+func countOnline(slaves []string, state *slaveState) int {
+	n := 0
+	for _, url := range slaves {
+		if state.isOnline(url) {
+			n++
+		}
+	}
+	return n
+}
+
+// onlineList returns URLs of all currently online slaves.
+func onlineList(slaves []string, state *slaveState) []string {
+	var out []string
+	for _, url := range slaves {
+		if state.isOnline(url) {
+			out = append(out, url)
+		}
+	}
+	return out
 }
