@@ -13,7 +13,7 @@ type DropDBRequest struct {
 type CreateTableRequest struct {
 	DBName  string            `json:"db_name"`
 	Table   string            `json:"table"`
-	Columns map[string]string `json:"columns"` // column name → MySQL type e.g. "age": "INT"
+	Columns map[string]string `json:"columns"`
 }
 
 type DropTableRequest struct {
@@ -24,38 +24,38 @@ type DropTableRequest struct {
 type InsertRequest struct {
 	DBName string         `json:"db_name"`
 	Table  string         `json:"table"`
-	Data   map[string]any `json:"data"` // column → value
+	Data   map[string]any `json:"data"`
 }
 
 type SelectRequest struct {
 	DBName    string `json:"db_name"`
 	Table     string `json:"table"`
-	Condition string `json:"condition"` // optional WHERE clause, e.g. "age > 20"
+	Condition string `json:"condition"`
 }
 
 type UpdateRequest struct {
 	DBName    string         `json:"db_name"`
 	Table     string         `json:"table"`
-	Data      map[string]any `json:"data"`      // columns to update
-	Condition string         `json:"condition"` // WHERE clause
+	Data      map[string]any `json:"data"`
+	Condition string         `json:"condition"`
 }
 
 type DeleteRequest struct {
 	DBName    string `json:"db_name"`
 	Table     string `json:"table"`
-	Condition string `json:"condition"` // WHERE clause
+	Condition string `json:"condition"`
 }
 
 // ---- What master sends to slaves (/internal/exec) ----
 
 type ExecRequest struct {
-	DBName    string         `json:"db_name"`
-	Operation string         `json:"operation"`  // CREATE_DB, DROP_DB, CREATE_TABLE, DROP_TABLE, INSERT, SELECT, UPDATE, DELETE
-	Table     string         `json:"table"`
-	Columns   map[string]string `json:"columns"` // for CREATE_TABLE
-	Data      map[string]any `json:"data"`
-	Condition string         `json:"condition"`
-	IsReplica bool           `json:"is_replica"` // true = write to _replica table instead
+	DBName    string            `json:"db_name"`
+	Operation string            `json:"operation"`
+	Table     string            `json:"table"`
+	Columns   map[string]string `json:"columns"`
+	Data      map[string]any    `json:"data"`
+	Condition string            `json:"condition"`
+	IsReplica bool              `json:"is_replica"`
 }
 
 // ---- What slaves return to master ----
@@ -68,13 +68,15 @@ type ExecResponse struct {
 
 // ---- Shard metadata ----
 
+// FIX (issue 2 / recovery): DBName added so recovery sync knows which
+// database a table belongs to without needing a separate lookup.
 type ShardInfo struct {
-	URL string `json:"url"`
-	Min int    `json:"min"` // min primary key this shard owns
-	Max int    `json:"max"` // max primary key this shard owns
+	URL    string `json:"url"`
+	Min    int    `json:"min"`
+	Max    int    `json:"max"`
+	DBName string `json:"db_name,omitempty"` // ← NEW
 }
 
-// key: table name → shard index (1 or 2) → ShardInfo
 type Metadata struct {
 	Shards map[string]map[string]ShardInfo `json:"shards"`
 }

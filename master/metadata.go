@@ -9,13 +9,12 @@ import (
 
 const metadataFile = "metadata.json"
 
-var metaMu sync.RWMutex // protects meta
+var metaMu sync.RWMutex
 
-// loadMetadata loads metadata from disk, or returns a fresh empty one
+// loadMetadata loads metadata from disk, or returns a fresh empty one.
 func loadMetadata() *Metadata {
 	data, err := os.ReadFile(metadataFile)
 	if err != nil {
-		// no file yet — start fresh
 		return &Metadata{Shards: make(map[string]map[string]ShardInfo)}
 	}
 
@@ -29,7 +28,7 @@ func loadMetadata() *Metadata {
 	return &m
 }
 
-// saveMetadata persists current metadata to disk
+// saveMetadata persists current metadata to disk.
 func saveMetadata(m *Metadata) {
 	metaMu.RLock()
 	defer metaMu.RUnlock()
@@ -45,8 +44,8 @@ func saveMetadata(m *Metadata) {
 	}
 }
 
-// registerTable adds shard info for a new table
-// splits the ID range (1..1000) evenly across however many slaves are online
+// registerTable adds shard info for a new table, splitting the ID range
+// (1..1000) evenly across however many slaves are online.
 func registerTable(m *Metadata, table string, onlineSlaves []string) {
 	metaMu.Lock()
 	defer metaMu.Unlock()
@@ -59,7 +58,7 @@ func registerTable(m *Metadata, table string, onlineSlaves []string) {
 		min := i*rangeSize + 1
 		max := (i + 1) * rangeSize
 		if i == count-1 {
-			max = 1000 // last shard gets the remainder
+			max = 1000
 		}
 		shards[fmt.Sprintf("shard_%d", i+1)] = ShardInfo{
 			URL: url,
@@ -71,7 +70,7 @@ func registerTable(m *Metadata, table string, onlineSlaves []string) {
 	m.Shards[table] = shards
 }
 
-// getShardForID returns the shard that owns the given primary key ID
+// getShardForID returns the shard that owns the given primary key ID.
 func getShardForID(m *Metadata, table string, id int) (ShardInfo, bool) {
 	metaMu.RLock()
 	defer metaMu.RUnlock()
@@ -90,7 +89,7 @@ func getShardForID(m *Metadata, table string, id int) (ShardInfo, bool) {
 	return ShardInfo{}, false
 }
 
-// getAllShards returns all shards for a given table
+// getAllShards returns all shards for a given table.
 func getAllShards(m *Metadata, table string) []ShardInfo {
 	metaMu.RLock()
 	defer metaMu.RUnlock()
@@ -107,9 +106,33 @@ func getAllShards(m *Metadata, table string) []ShardInfo {
 	return result
 }
 
-// removeTable removes a table's shard info from metadata
+// removeTable removes a table's shard info from metadata.
 func removeTable(m *Metadata, table string) {
 	metaMu.Lock()
 	defer metaMu.Unlock()
 	delete(m.Shards, table)
+}
+
+// getAllTableNames returns a map of tableName → dbName for every table
+// registered in the metadata. Used by recovery sync.
+//
+// NOTE: metadata currently only stores shard info, not the db_name. We store
+// the db_name inside ShardInfo.DBName (added to models.go). If no DBName is
+// set (legacy metadata), we return an empty string and callers must handle it.
+func getAllTableNames(m *Metadata) map[string]string {
+	metaMu.RLock()
+	defer metaMu.RUnlock()
+
+	result := make(map[string]string, len(m.Shards))
+	for table, shards := range m.Shards {
+		dbName := ""
+		for _, s := range shards {
+			if s.DBName != "" {
+				dbName = s.DBName
+				break
+			}
+		}
+		result[table] = dbName
+	}
+	return result
 }
