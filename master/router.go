@@ -10,6 +10,14 @@ var insertCounter int
 var insertMu sync.Mutex
 
 // routeInsert uses round-robin to pick a primary slave, replica is any other online slave.
+//
+// FIX (#3): We reset insertCounter to 0 whenever the number of online slaves
+// changes. Without this, the counter keeps its old value across topology changes.
+// Example: counter=5, 2 slaves online → idx=1 (fine). One slave drops → 1 slave
+// online, counter=5 → idx=5%1=0 (still fine, but counter keeps growing). Now
+// slave comes back → 2 slaves online, counter=6 → idx=0 again, so slave[0] gets
+// every insert until counter happens to be odd. Resetting on change means the
+// first insert after any topology change always starts cleanly at index 0.
 func routeInsert(slaves []string, state *slaveState) (primary string, replica string, err error) {
 	var online []string
 	for _, url := range slaves {
@@ -22,6 +30,12 @@ func routeInsert(slaves []string, state *slaveState) (primary string, replica st
 	}
 
 	insertMu.Lock()
+	// Reset counter when the pool size has changed since the last insert.
+	// lastOnlineCount is tracked below so we can detect the change.
+	if len(online) != lastOnlineCount {
+		insertCounter = 0
+		lastOnlineCount = len(online)
+	}
 	idx := insertCounter % len(online)
 	insertCounter++
 	insertMu.Unlock()
@@ -35,6 +49,10 @@ func routeInsert(slaves []string, state *slaveState) (primary string, replica st
 	}
 	return primary, replica, nil
 }
+
+// lastOnlineCount remembers how many slaves were online during the previous
+// insert, so routeInsert can detect topology changes and reset the counter.
+var lastOnlineCount int
 
 // routeSelectByID routes a single-ID lookup using modulo so it scales to any
 // number of slaves and stays consistent with auto_increment_offset assignments.

@@ -40,23 +40,38 @@ func sendToSlave(slaveURL string, req ExecRequest) (*ExecResponse, error) {
 	return &result, nil
 }
 
-// broadcastToAll sends the same ExecRequest to every slave
-// used for DDL operations (CREATE DB, DROP DB, CREATE TABLE, DROP TABLE)
-// skips offline slaves and logs them
+// broadcastToAll sends the same ExecRequest to every *online* slave.
+// Used for DDL operations (CREATE DB, DROP DB, CREATE TABLE, DROP TABLE).
+//
+// FIX (#7): Previously, offline slaves were sent to the channel as errors,
+// which caused every DDL call to fail whenever any slave was down. That
+// defeats the point of fault tolerance. Now we simply skip offline slaves
+// and only report actual network/response errors from slaves we did reach.
+// The caller (handleCreateDB etc.) only gets errors if an online slave fails.
 func broadcastToAll(slaves []string, state *slaveState, req ExecRequest) []error {
 	type result struct {
 		url string
 		err error
 	}
 
-	ch := make(chan result, len(slaves))
-
+	// Only attempt to contact online slaves.
+	var targets []string
 	for _, url := range slaves {
+		if state.isOnline(url) {
+			targets = append(targets, url)
+		} else {
+			fmt.Printf("  ⚠ Skipping offline slave %s for DDL broadcast\n", url)
+		}
+	}
+
+	if len(targets) == 0 {
+		return []error{fmt.Errorf("no online slaves to broadcast to")}
+	}
+
+	ch := make(chan result, len(targets))
+
+	for _, url := range targets {
 		go func(u string) {
-			if !state.isOnline(u) {
-				ch <- result{url: u, err: fmt.Errorf("slave offline")}
-				return
-			}
 			resp, err := sendToSlave(u, req)
 			if err != nil {
 				ch <- result{url: u, err: err}
@@ -71,7 +86,7 @@ func broadcastToAll(slaves []string, state *slaveState, req ExecRequest) []error
 	}
 
 	var errs []error
-	for range slaves {
+	for range targets {
 		r := <-ch
 		if r.err != nil {
 			fmt.Printf("  ✗ Broadcast to %s failed: %v\n", r.url, r.err)

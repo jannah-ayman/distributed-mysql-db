@@ -61,7 +61,13 @@ func main() {
 	defer db.Close()
 	fmt.Println("✓ Connected to MySQL")
 
-	// auto_increment settings so each slave gets unique IDs.
+	// FIX (#12): auto_increment settings must succeed or IDs will collide across
+	// slaves. Previously db.Exec errors were discarded, so a MySQL user without
+	// SUPER/SYSTEM_VARIABLES_ADMIN privilege would silently produce overlapping
+	// IDs, causing primary-key conflicts on INSERT.
+	// We now check both SET GLOBAL calls and crash loudly if they fail.
+	// If your MySQL user lacks the privilege, grant it with:
+	//   GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'youruser'@'%';
 	slaveIndex := os.Getenv("SLAVE_INDEX")
 	if slaveIndex == "" {
 		slaveIndex = "0"
@@ -70,12 +76,22 @@ func main() {
 	if totalSlaves == "" {
 		totalSlaves = "2"
 	}
-	db.Exec("SET GLOBAL auto_increment_increment = " + totalSlaves)
-	db.Exec("SET GLOBAL auto_increment_offset = " + func() string {
-		var idx int
-		fmt.Sscan(slaveIndex, &idx)
-		return fmt.Sprintf("%d", idx+1)
-	}())
+
+	var idx int
+	fmt.Sscan(slaveIndex, &idx)
+	offset := idx + 1 // slave[0] → offset 1, slave[1] → offset 2, etc.
+
+	if _, err := db.Exec("SET GLOBAL auto_increment_increment = " + totalSlaves); err != nil {
+		fmt.Printf("✗ Could not set auto_increment_increment: %v\n", err)
+		fmt.Println("  Hint: GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO your MySQL user")
+		os.Exit(1)
+	}
+	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL auto_increment_offset = %d", offset)); err != nil {
+		fmt.Printf("✗ Could not set auto_increment_offset: %v\n", err)
+		fmt.Println("  Hint: GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO your MySQL user")
+		os.Exit(1)
+	}
+	fmt.Printf("✓ auto_increment_increment=%s, auto_increment_offset=%d\n", totalSlaves, offset)
 
 	localMeta := &Metadata{Shards: make(map[string]map[string]ShardInfo)}
 

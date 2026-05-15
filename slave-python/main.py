@@ -1,4 +1,4 @@
-import os, json, hashlib, threading, time, requests
+import os, json, hashlib, threading, time, requests, sys
 from flask import Flask, request, jsonify
 from db import (
     get_connection, create_database, drop_database,
@@ -15,17 +15,35 @@ app = Flask(__name__)
 DSN = os.environ.get("MYSQL_DSN", "root:password@127.0.0.1:3306")
 conn = get_connection(DSN)
 print("✓ Connected to MySQL")
+
+# FIX (#12): auto_increment settings must succeed or IDs will collide across
+# slaves. Previously cursor.execute errors were silently swallowed by the
+# try/except around the whole startup block (or simply not caught), so a MySQL
+# user without SYSTEM_VARIABLES_ADMIN privilege would let both slaves generate
+# the same IDs, causing primary-key conflicts on INSERT.
+# We now check both SET GLOBAL calls explicitly and exit loudly if they fail.
+# If your MySQL user lacks the privilege, grant it with:
+#   GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'youruser'@'%';
 offset = int(os.environ.get("SLAVE_OFFSET", "2"))
-cursor = conn.cursor()
-cursor.execute("SET GLOBAL auto_increment_increment = 2")
-cursor.execute(f"SET GLOBAL auto_increment_offset = {offset}")
-cursor.close()
+total_slaves = int(os.environ.get("TOTAL_SLAVES", "2"))
+
+try:
+    cursor = conn.cursor()
+    cursor.execute(f"SET GLOBAL auto_increment_increment = {total_slaves}")
+    cursor.execute(f"SET GLOBAL auto_increment_offset = {offset}")
+    cursor.close()
+    print(f"✓ auto_increment_increment={total_slaves}, auto_increment_offset={offset}")
+except Exception as e:
+    print(f"✗ Could not set auto_increment variables: {e}")
+    print("  Hint: GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO your MySQL user")
+    sys.exit(1)
 
 # --- Local metadata copy (master will sync this) ---
 local_meta = {"shards": {}}
 
 master_url = os.environ.get("MASTER_URL", "http://localhost:8095")
 acting_as_master = False
+acting_as_master_lock = threading.Lock()
 
 
 # ---- Auth helper ----
@@ -131,13 +149,12 @@ def sync_metadata():
 
 @app.route("/promote", methods=["GET"])
 def promote_status():
-    return jsonify({"acting_master": acting_as_master}), 200
+    with acting_as_master_lock:
+        is_master = acting_as_master
+    return jsonify({"acting_master": is_master}), 200
 
 
 # ---- Promoted-master routes ----
-# These are always registered but return 503 unless acting_as_master is True.
-# When the GUI's discoverMaster() hits /ping and gets 200, it switches here.
-# Then these routes serve the GUI directly from this slave's own MySQL.
 
 def require_master(f):
     from functools import wraps
@@ -145,7 +162,9 @@ def require_master(f):
     def wrapper(*args, **kwargs):
         if request.method == "OPTIONS":
             return "", 200
-        if not acting_as_master:
+        with acting_as_master_lock:
+            is_master = acting_as_master
+        if not is_master:
             return jsonify({"success": False, "error": "not the master"}), 503
         if not authenticate():
             return "Unauthorized", 401
@@ -195,7 +214,6 @@ def promoted_create_table():
     body = request.get_json()
     try:
         create_table(conn, body["db_name"], body["table"], body.get("columns", {}))
-        # keep _replica table in sync
         try:
             create_table(conn, body["db_name"], body["table"] + "_replica", body.get("columns", {}))
         except Exception:
@@ -242,7 +260,6 @@ def promoted_select():
     table     = request.args.get("table", "")
     condition = request.args.get("condition", "")
     try:
-        # Read both primary and replica tables, merge by id.
         rows1 = select_rows(conn, db_name, table, condition)
         try:
             rows2 = select_rows(conn, db_name, table + "_replica", condition)
@@ -311,9 +328,10 @@ def watch_master():
             r = requests.get(master_url + "/health",
                              headers={"X-Auth-Token": AUTH_TOKEN}, timeout=3)
             if r.status_code == 200:
-                if acting_as_master:
+                with acting_as_master_lock:
+                    was_master = acting_as_master
+                if was_master:
                     print("  ✓ Real master is back — reverting to slave mode")
-                    # Push our metadata back to the master.
                     try:
                         requests.post(
                             master_url + "/internal/sync-metadata",
@@ -324,7 +342,8 @@ def watch_master():
                         print("  ✓ Pushed metadata to recovered master")
                     except Exception as e:
                         print(f"  ✗ Could not push metadata to master: {e}")
-                acting_as_master = False
+                with acting_as_master_lock:
+                    acting_as_master = False
                 fails = 0
                 continue
         except Exception:
@@ -332,9 +351,11 @@ def watch_master():
 
         fails += 1
         print(f"  ⚠ Master unreachable ({fails}/3)")
-        if fails >= 3 and not acting_as_master:
-            acting_as_master = True
-            print("  ★ Acting as master now")
+        if fails >= 3:
+            with acting_as_master_lock:
+                if not acting_as_master:
+                    acting_as_master = True
+                    print("  ★ Acting as master now")
 
 
 threading.Thread(target=watch_master, daemon=True).start()
