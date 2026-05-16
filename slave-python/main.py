@@ -8,7 +8,8 @@ from db import (
 
 AUTH_TOKEN = "my-secret-token-123"
 AUTH_TOKEN_HASH = hashlib.sha256(AUTH_TOKEN.encode()).hexdigest()
-
+promoted_insert_counter = 0
+promoted_insert_lock = threading.Lock()
 app = Flask(__name__)
 
 # --- MySQL connection ---
@@ -263,32 +264,83 @@ def promoted_drop_table():
 @app.route("/tables/insert", methods=["POST", "OPTIONS"])
 @require_master
 def promoted_insert():
+    global promoted_insert_counter
+
     body = request.get_json()
     db_name = body["db_name"]
     table = body["table"]
     data = body.get("data", {})
 
     try:
-        # Insert on this slave as primary, get the generated ID
-        cursor = conn.cursor()
-        cols = ", ".join(f"`{c}`" for c in data.keys())
-        placeholders = ", ".join(["%s"] * len(data))
-        cursor.execute(
-            f"INSERT INTO `{db_name}`.`{table}` ({cols}) VALUES ({placeholders})",
-            list(data.values())
-        )
-        generated_id = cursor.lastrowid
-        cursor.close()
+        with promoted_insert_lock:
+            my_turn = (promoted_insert_counter % 2) == 0
+            promoted_insert_counter += 1
 
-        # Broadcast to peer as replica WITH the same ID
-        data_with_id = {**data, "id": generated_id}
-        broadcast_to_peers("POST", "/internal/exec", {
-            "db_name": db_name,
-            "operation": "UPSERT",
-            "table": table,
-            "data": data_with_id,
-            "is_replica": True   # peer stores it as replica only
-        })
+        if my_turn:
+            # This slave is primary
+            cursor = conn.cursor()
+            cols = ", ".join(f"`{c}`" for c in data.keys())
+            placeholders = ", ".join(["%s"] * len(data))
+            cursor.execute(
+                f"INSERT INTO `{db_name}`.`{table}` ({cols}) VALUES ({placeholders})",
+                list(data.values())
+            )
+            generated_id = cursor.lastrowid
+            cursor.close()
+
+            # Peer gets replica with same ID
+            data_with_id = {**data, "id": generated_id}
+            broadcast_to_peers("POST", "/internal/exec", {
+                "db_name": db_name,
+                "operation": "UPSERT",
+                "table": table,
+                "data": data_with_id,
+                "is_replica": True
+            })
+            print(f"  [promoted] ✓ Inserted into {db_name}.{table} id={generated_id} (self=primary)")
+
+        else:
+            # Peer slave is primary, send it there
+            peer_url = peer_slave_urls[0]
+            resp = requests.post(
+                peer_url + "/internal/exec",
+                json={
+                    "db_name": db_name,
+                    "operation": "INSERT",
+                    "table": table,
+                    "data": data,
+                    "is_replica": False
+                },
+                headers={"X-Auth-Token": AUTH_TOKEN},
+                timeout=5
+            )
+            result = resp.json()
+            if not result.get("success"):
+                return jsonify({"success": False, "error": result.get("error")}), 500
+
+            # Get the ID the peer generated
+            # Fetch the last inserted row to get its ID
+            rows = select_rows(conn, db_name, table + "_replica", "1=1 ORDER BY id DESC LIMIT 1")
+            
+            # Now insert as replica on this slave with same ID from peer
+            # We need the ID from peer - fetch it
+            peer_rows_resp = requests.post(
+                peer_url + "/internal/exec",
+                json={
+                    "db_name": db_name,
+                    "operation": "SELECT",
+                    "table": table,
+                    "condition": "1=1 ORDER BY id DESC LIMIT 1",
+                    "is_replica": False
+                },
+                headers={"X-Auth-Token": AUTH_TOKEN},
+                timeout=5
+            )
+            peer_data = peer_rows_resp.json()
+            if peer_data.get("rows"):
+                last_row = peer_data["rows"][0]
+                insert_row(conn, db_name, table + "_replica", last_row)
+                print(f"  [promoted] ✓ Inserted into {db_name}.{table} id={last_row.get('id')} (peer=primary)")
 
         return jsonify({"success": True, "message": "Row inserted"}), 200
     except Exception as e:
