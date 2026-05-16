@@ -8,8 +8,6 @@ from db import (
 
 AUTH_TOKEN = "my-secret-token-123"
 AUTH_TOKEN_HASH = hashlib.sha256(AUTH_TOKEN.encode()).hexdigest()
-promoted_insert_counter = 0
-promoted_insert_lock = threading.Lock()
 app = Flask(__name__)
 
 # --- MySQL connection ---
@@ -20,10 +18,6 @@ print("✓ Connected to MySQL")
 offset = int(os.environ.get("SLAVE_OFFSET", "2"))
 total_slaves = int(os.environ.get("TOTAL_SLAVES", "2"))
 
-# FIX (#10): set both GLOBAL and SESSION so the current connection uses the
-# correct auto_increment values immediately. GLOBAL only affects new
-# connections opened after the SET, so without SESSION the very first inserts
-# on this connection could collide with the other slave.
 try:
     cursor = conn.cursor()
     cursor.execute(f"SET GLOBAL auto_increment_increment = {total_slaves}")
@@ -42,9 +36,6 @@ local_meta = {"shards": {}}
 
 master_url = os.environ.get("MASTER_URL", "http://192.168.1.105:8095")
 
-# FIX (#3 split-brain): read peer slave URLs so we can check if another slave
-# has already promoted before we do. Set via PEER_SLAVE_URLS env var,
-# comma-separated, e.g. "http://localhost:8081"
 peer_slave_urls = ["http://192.168.1.105:8081"]
 
 acting_as_master = False
@@ -119,6 +110,11 @@ def exec_handler():
             return ok()
         elif operation == "INSERT":
             insert_row(conn, db_name, table, data)
+            return ok()
+        elif operation == "UPSERT":
+            # INSERT ... ON DUPLICATE KEY UPDATE so recovery replays are idempotent
+            from db import upsert_row
+            upsert_row(conn, db_name, table, data)
             return ok()
         elif operation == "SELECT":
             rows = select_rows(conn, db_name, table, condition)
@@ -261,91 +257,64 @@ def promoted_drop_table():
         return jsonify({"success": True, "message": "Table dropped"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/tables/insert", methods=["POST", "OPTIONS"])
 @require_master
 def promoted_insert():
-    global promoted_insert_counter
+    """
+    FIX (promoted insert round-robin):
+    When a slave is promoted it is the SOLE master — there is no other master
+    to share the primary role with. The correct behaviour is:
 
+      1. Always INSERT the new row into THIS slave's primary table so that
+         MySQL assigns a deterministic ID via auto_increment.
+      2. Send that row (with its generated ID) as an UPSERT to every peer
+         slave's _replica table so they have a copy for fault-tolerance.
+
+    The old code tried to alternate "primary" responsibility between self and
+    the peer using a counter. That was wrong for two reasons:
+      a) The peer slave is NOT a promoted master — it should not own primary rows.
+      b) The fetch-back SELECT used to get the peer-generated ID had a TOCTOU
+         race: another insert could have happened between the INSERT and SELECT,
+         causing the wrong row to be stored as the replica here.
+    """
     body = request.get_json()
     db_name = body["db_name"]
-    table = body["table"]
-    data = body.get("data", {})
+    table   = body["table"]
+    data    = body.get("data", {})
 
     try:
-        with promoted_insert_lock:
-            my_turn = (promoted_insert_counter % 2) == 0
-            promoted_insert_counter += 1
+        # Step 1: insert into local primary table, capture the generated ID.
+        cursor = conn.cursor()
+        cols         = ", ".join(f"`{c}`" for c in data.keys())
+        placeholders = ", ".join(["%s"] * len(data))
+        cursor.execute(
+            f"INSERT INTO `{db_name}`.`{table}` ({cols}) VALUES ({placeholders})",
+            list(data.values())
+        )
+        generated_id = cursor.lastrowid
+        conn.commit()   # autocommit is on, but be explicit
+        cursor.close()
 
-        if my_turn:
-            # This slave is primary
-            cursor = conn.cursor()
-            cols = ", ".join(f"`{c}`" for c in data.keys())
-            placeholders = ", ".join(["%s"] * len(data))
-            cursor.execute(
-                f"INSERT INTO `{db_name}`.`{table}` ({cols}) VALUES ({placeholders})",
-                list(data.values())
-            )
-            generated_id = cursor.lastrowid
-            cursor.close()
+        print(f"  [promoted] ✓ Inserted into {db_name}.{table} id={generated_id} (self=primary)")
 
-            # Peer gets replica with same ID
-            data_with_id = {**data, "id": generated_id}
-            broadcast_to_peers("POST", "/internal/exec", {
-                "db_name": db_name,
-                "operation": "UPSERT",
-                "table": table,
-                "data": data_with_id,
-                "is_replica": True
-            })
-            print(f"  [promoted] ✓ Inserted into {db_name}.{table} id={generated_id} (self=primary)")
-
-        else:
-            # Peer slave is primary, send it there
-            peer_url = peer_slave_urls[0]
-            resp = requests.post(
-                peer_url + "/internal/exec",
-                json={
-                    "db_name": db_name,
-                    "operation": "INSERT",
-                    "table": table,
-                    "data": data,
-                    "is_replica": False
-                },
-                headers={"X-Auth-Token": AUTH_TOKEN},
-                timeout=5
-            )
-            result = resp.json()
-            if not result.get("success"):
-                return jsonify({"success": False, "error": result.get("error")}), 500
-
-            # Get the ID the peer generated
-            # Fetch the last inserted row to get its ID
-            rows = select_rows(conn, db_name, table + "_replica", "1=1 ORDER BY id DESC LIMIT 1")
-            
-            # Now insert as replica on this slave with same ID from peer
-            # We need the ID from peer - fetch it
-            peer_rows_resp = requests.post(
-                peer_url + "/internal/exec",
-                json={
-                    "db_name": db_name,
-                    "operation": "SELECT",
-                    "table": table,
-                    "condition": "1=1 ORDER BY id DESC LIMIT 1",
-                    "is_replica": False
-                },
-                headers={"X-Auth-Token": AUTH_TOKEN},
-                timeout=5
-            )
-            peer_data = peer_rows_resp.json()
-            if peer_data.get("rows"):
-                last_row = peer_data["rows"][0]
-                insert_row(conn, db_name, table + "_replica", last_row)
-                print(f"  [promoted] ✓ Inserted into {db_name}.{table} id={last_row.get('id')} (peer=primary)")
+        # Step 2: replicate to every peer's _replica table with the exact same ID.
+        data_with_id = {**data, "id": generated_id}
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name":    db_name,
+            "operation":  "UPSERT",
+            "table":      table,
+            "data":       data_with_id,
+            "is_replica": True
+        })
 
         return jsonify({"success": True, "message": "Row inserted"}), 200
+
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-    
+
+
 @app.route("/tables/select", methods=["GET", "OPTIONS"])
 @require_master
 def promoted_select():
@@ -442,10 +411,6 @@ def err(msg: str):
 # ---- Master watcher ----
 
 def another_slave_is_acting_as_master() -> bool:
-    """
-    FIX (#3 split-brain): check all peer slaves before self-promoting.
-    Returns True if any peer is already acting as master.
-    """
     for peer_url in peer_slave_urls:
         try:
             r = requests.get(
@@ -498,7 +463,6 @@ def watch_master():
                         print(f"  ✗ Could not push metadata to master: {e}")
                 with acting_as_master_lock:
                     acting_as_master = False
-                # FIX (#2): reset fails on successful master contact.
                 fails = 0
                 continue
         except Exception:
@@ -510,8 +474,6 @@ def watch_master():
             with acting_as_master_lock:
                 already = acting_as_master
             if not already:
-                # FIX (#3 split-brain): only promote if no peer slave has
-                # already done so.
                 if not another_slave_is_acting_as_master():
                     with acting_as_master_lock:
                         acting_as_master = True

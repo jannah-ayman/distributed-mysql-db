@@ -15,7 +15,7 @@ const authToken = "my-secret-token-123"
 var authTokenHash = fmt.Sprintf("%x", sha256.Sum256([]byte(authToken)))
 
 var allSlaves = []string{
-	// "http://localhost:8081",     // slave-go
+	"http://192.168.1.105:8081", // slave-go
 	"http://192.168.1.108:8082", // slave-python
 }
 
@@ -33,9 +33,9 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // fetchMetadataFromSlaves tries to pull metadata from any online slave.
-// Used on master restart so it picks up any schema changes that happened
-// while it was down (e.g. a slave was promoted and created a table).
-func fetchMetadataFromSlaves(slaves []string) *Metadata {
+// Used on master restart to pick up schema changes that happened while it was
+// down (e.g. a slave was promoted and created a table).
+func fetchMetadataFromSlaves(slaves []string) (*Metadata, string) {
 	client := http.Client{Timeout: 5 * time.Second}
 	for _, url := range slaves {
 		req, err := http.NewRequest("GET", url+"/internal/metadata", nil)
@@ -55,16 +55,35 @@ func fetchMetadataFromSlaves(slaves []string) *Metadata {
 		resp.Body.Close()
 		if len(m.Shards) > 0 {
 			fmt.Printf("  ✓ Pulled metadata from %s (%d tables)\n", url, len(m.Shards))
-			return &m
+			return &m, url
 		}
 	}
-	return nil
+	return nil, ""
 }
 
-// readCloser is a small helper used in pushes (avoids import of bytes in other files).
-func readCloser(b []byte) *bytes.Reader {
-	return bytes.NewReader(b)
+// resolveMetadataURLs replaces the placeholder "self" URL that promoted slaves
+// store in their local metadata with the slave's actual URL.
+//
+// FIX (master recovery metadata):
+// When a slave promotes itself and creates/tracks tables, it records its own
+// shard URL as "self" (because it doesn't know its own external URL at that
+// point). When the master pulls this metadata on restart it must rewrite those
+// "self" entries to the real URL of the slave that provided the metadata,
+// otherwise the master's shard map contains an unusable placeholder and routing
+// to that slave will fail.
+func resolveMetadataURLs(m *Metadata, sourceURL string) {
+	for table, shards := range m.Shards {
+		for key, info := range shards {
+			if info.URL == "self" {
+				info.URL = sourceURL
+				shards[key] = info
+				fmt.Printf("  ✓ Resolved shard URL for table %s: self → %s\n", table, sourceURL)
+			}
+		}
+		m.Shards[table] = shards
+	}
 }
+
 func slaveWasPromoted(slaves []string) bool {
 	client := http.Client{Timeout: 3 * time.Second}
 	for _, url := range slaves {
@@ -86,6 +105,12 @@ func slaveWasPromoted(slaves []string) bool {
 	}
 	return false
 }
+
+// readCloser is a small helper used in pushes.
+func readCloser(b []byte) *bytes.Reader {
+	return bytes.NewReader(b)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -95,12 +120,15 @@ func main() {
 	// Load metadata from disk first.
 	meta := loadMetadata()
 
-	// If disk metadata is empty, try to pull from a slave — the master may have
-	// crashed while a promoted slave handled requests and updated the schema.
+	// If a slave was promoted while the master was down, pull its metadata so
+	// we learn about any schema changes that happened during the outage.
 	fmt.Println("Checking if a slave was promoted while master was down...")
 	if slaveWasPromoted(allSlaves) {
 		fmt.Println("  A slave was acting as master — pulling its metadata...")
-		if pulled := fetchMetadataFromSlaves(allSlaves); pulled != nil {
+		if pulled, sourceURL := fetchMetadataFromSlaves(allSlaves); pulled != nil {
+			// FIX: rewrite "self" URLs to the actual slave URL before merging.
+			resolveMetadataURLs(pulled, sourceURL)
+
 			for table, shards := range pulled.Shards {
 				if _, exists := meta.Shards[table]; !exists {
 					meta.Shards[table] = shards
@@ -111,21 +139,30 @@ func main() {
 		}
 	}
 
+	// FIX (master recovery): newSlaveState now initialises all slaves as
+	// offline=false. The first heartbeat tick will find them online and
+	// transition each one offline→online, which triggers syncSlaveOnRecovery
+	// automatically. This ensures every slave is brought up to date with any
+	// writes that happened (via the promoted slave) while the master was down,
+	// without requiring any manual intervention.
 	state := newSlaveState(allSlaves)
 
-	fmt.Println("Checking slaves...")
+	// We still do an initial ping to log their status, but we no longer set
+	// them as online here — the heartbeat loop handles that.
+	fmt.Println("Checking slaves (initial ping, recovery handled by heartbeat)...")
 	ch := make(chan SlaveStatus, len(allSlaves))
 	for _, url := range allSlaves {
 		go checkSlave(url, ch)
 	}
 	for range allSlaves {
 		s := <-ch
-		state.setOnline(s.URL, s.Online)
 		if s.Online {
 			fmt.Printf("  ✓ %s is online\n", s.URL)
 		} else {
 			fmt.Printf("  ✗ %s is offline\n", s.URL)
 		}
+		// Do NOT call state.setOnline here — leave state as false so the
+		// heartbeat triggers the offline→online transition and recovery sync.
 	}
 
 	startHeartbeat(allSlaves, state, meta, 5*time.Second)
@@ -139,7 +176,7 @@ func main() {
 		w.Write([]byte("pong"))
 	}))
 
-	// Also accept metadata pushes from a recovering slave.
+	// Accept metadata pushes from a recovering slave.
 	http.HandleFunc("/internal/sync-metadata", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if !authenticate(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -154,7 +191,6 @@ func main() {
 			http.Error(w, "Bad request", http.StatusBadRequest)
 			return
 		}
-		// Merge: keep any shards the master already knows about, add new ones.
 		for table, shards := range incoming.Shards {
 			if _, exists := meta.Shards[table]; !exists {
 				meta.Shards[table] = shards

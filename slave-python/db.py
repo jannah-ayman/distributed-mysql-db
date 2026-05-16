@@ -23,11 +23,6 @@ def get_connection(dsn: str):
 
 
 def _serialize(value):
-    """
-    FIX (#7): MySQL Python connector returns types that are not JSON
-    serializable: datetime.date, datetime.datetime, decimal.Decimal, bytes.
-    Convert them to plain Python types so Flask's jsonify never crashes.
-    """
     if isinstance(value, (datetime.datetime, datetime.date)):
         return value.isoformat()
     if isinstance(value, decimal.Decimal):
@@ -50,10 +45,6 @@ def drop_database(conn, db_name: str):
 
 
 def create_table(conn, db_name: str, table: str, columns: dict):
-    """
-    columns: { "name": "VARCHAR(100)", "age": "INT", ... }
-    always adds an auto-increment id as primary key
-    """
     parts = ["`id` INT AUTO_INCREMENT PRIMARY KEY"]
     for col, col_type in columns.items():
         parts.append(f"`{col}` {col_type}")
@@ -81,6 +72,33 @@ def insert_row(conn, db_name: str, table: str, data: dict):
     cursor.close()
 
 
+def upsert_row(conn, db_name: str, table: str, data: dict):
+    """
+    INSERT ... ON DUPLICATE KEY UPDATE so that replaying a row that already
+    exists (e.g. during recovery) is idempotent and never raises a PK error.
+    The 'id' column is included in the INSERT so that replica rows keep their
+    original ID; it is excluded from the ON DUPLICATE KEY UPDATE clause so we
+    never overwrite the PK itself.
+    """
+    cols         = ", ".join(f"`{c}`" for c in data.keys())
+    placeholders = ", ".join(["%s"] * len(data))
+    values       = list(data.values())
+
+    updates = ", ".join(
+        f"`{c}` = VALUES(`{c}`)"
+        for c in data.keys()
+        if c != "id"
+    )
+
+    query = (
+        f"INSERT INTO `{db_name}`.`{table}` ({cols}) VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {updates}"
+    )
+    cursor = conn.cursor()
+    cursor.execute(query, values)
+    cursor.close()
+
+
 def select_rows(conn, db_name: str, table: str, condition: str) -> list[dict]:
     query = f"SELECT * FROM `{db_name}`.`{table}`"
     if condition:
@@ -91,8 +109,6 @@ def select_rows(conn, db_name: str, table: str, condition: str) -> list[dict]:
     rows = cursor.fetchall()
     cursor.close()
 
-    # FIX (#7): apply _serialize to every value so the result is always
-    # JSON-safe regardless of column type (DATE, FLOAT, BLOB, etc.).
     return [{k: _serialize(v) for k, v in row.items()} for row in rows]
 
 

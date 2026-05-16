@@ -17,10 +17,17 @@ type slaveState struct {
 	status map[string]bool
 }
 
+// FIX (master recovery): initialize all slaves as OFFLINE (false) instead of
+// online (true). This way the very first heartbeat tick that finds them alive
+// transitions them from offline→online and triggers syncSlaveOnRecovery for
+// each one. Without this, when the master restarts after a downtime all slaves
+// appear to have been "online the whole time" so no recovery sync is ever
+// kicked off, and the slaves that missed writes while the master was down are
+// never brought up to date.
 func newSlaveState(urls []string) *slaveState {
 	s := &slaveState{status: make(map[string]bool)}
 	for _, url := range urls {
-		s.status[url] = true
+		s.status[url] = false // start as offline; first heartbeat will correct this
 	}
 	return s
 }
@@ -88,6 +95,10 @@ func startHeartbeat(slaves []string, state *slaveState, meta *Metadata, interval
 				if wasOnline && !s.Online {
 					fmt.Printf("  ✗ Slave %s went OFFLINE\n", s.URL)
 				} else if !wasOnline && s.Online {
+					// FIX (master recovery): this branch now also fires on the
+					// very first heartbeat tick (because newSlaveState sets all
+					// slaves to offline), so recovery sync runs automatically
+					// whenever the master starts up and finds its slaves alive.
 					fmt.Printf("  ✓ Slave %s came back ONLINE — starting recovery sync\n", s.URL)
 					for _, donor := range slaves {
 						if donor != s.URL && state.isOnline(donor) {
@@ -107,19 +118,6 @@ func startHeartbeat(slaves []string, state *slaveState, meta *Metadata, interval
 }
 
 // syncSlaveOnRecovery copies all rows the recovered slave missed while offline.
-//
-// FIX (#4/#9): The original code passed the full row (including "id") into
-// INSERT, which caused primary-key conflicts when the row already existed or
-// when DELETE failed silently. The fix:
-//  1. Use UPDATE … WHERE id=N first (idempotent, handles stale rows).
-//  2. Only INSERT if the UPDATE matched 0 rows (i.e. the row is truly missing).
-//     When inserting we strip the "id" key so MySQL assigns it via
-//     auto_increment — this guarantees no PK collision.
-//
-// Because auto_increment_offset is set to match the original slave's index,
-// MySQL will re-assign the same id value automatically as long as the table
-// still has the same offset configuration, which it does (the slave restarts
-// with the same SLAVE_INDEX env var).
 func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 	fmt.Printf("  → Recovery: copying missing data from %s to %s\n", donorURL, recoveredURL)
 
@@ -132,7 +130,6 @@ func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 	client := http.Client{Timeout: 30 * time.Second}
 
 	for dbTable, dbName := range tables {
-		// Fetch rows from donor's _replica table (these are the recovered slave's rows).
 		fetchReq := ExecRequest{
 			DBName:    dbName,
 			Operation: "SELECT",

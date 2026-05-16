@@ -10,12 +10,11 @@ import (
 	"time"
 )
 
-var isMaster int32              // 0 = normal slave, 1 = acting as master
-var promotedInsertCounter int64 // use atomic counter to generate unique IDs for inserts that happen while promoted, so they can be merged back without conflicts when the real master recovers.
+var isMaster int32 // 0 = normal slave, 1 = acting as master
+
 // watchMaster pings the real master every 5s.
 // After 3 consecutive failures (~15s) this slave promotes itself —
-// but ONLY if it is the lowest-indexed slave still reachable, to prevent
-// split-brain (two slaves promoting simultaneously).
+// but ONLY if no other peer slave has already promoted, to prevent split-brain.
 // When the master comes back, it reverts to slave mode and pushes
 // its local metadata back to the master.
 func watchMaster(masterURL string, db *sql.DB, localMeta *Metadata) {
@@ -31,10 +30,6 @@ func watchMaster(masterURL string, db *sql.DB, localMeta *Metadata) {
 			fails++
 			fmt.Printf("  ⚠ Master unreachable (%d/3)\n", fails)
 			if fails >= 3 && atomic.LoadInt32(&isMaster) == 0 {
-				// FIX (#3 split-brain): before promoting, check if another slave
-				// is already acting as master. We pick the slave with the lowest
-				// port number as the tie-breaker — only promote if no other slave
-				// has already promoted itself.
 				if !anotherSlaveIsActingAsMaster() {
 					promote()
 				} else {
@@ -48,8 +43,6 @@ func watchMaster(masterURL string, db *sql.DB, localMeta *Metadata) {
 				pushMetadataToMaster(masterURL, localMeta)
 			}
 			atomic.StoreInt32(&isMaster, 0)
-			// FIX (#2): reset fails counter when master is reachable again,
-			// so the next outage starts a clean count from 0.
 			fails = 0
 		}
 	}
@@ -57,7 +50,6 @@ func watchMaster(masterURL string, db *sql.DB, localMeta *Metadata) {
 
 // anotherSlaveIsActingAsMaster checks all known peer slaves to see if any
 // has already promoted itself. This prevents split-brain.
-// FIX (#3): this function is the core of the split-brain prevention.
 func anotherSlaveIsActingAsMaster() bool {
 	client := http.Client{Timeout: 2 * time.Second}
 	for _, peerURL := range peerSlaveURLs {
@@ -81,6 +73,7 @@ func anotherSlaveIsActingAsMaster() bool {
 	}
 	return false
 }
+
 func sendExecHTTP(url string, req ExecRequest) (*ExecResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -131,6 +124,7 @@ func broadcastToPeers(req ExecRequest) {
 		}(peer)
 	}
 }
+
 func promote() {
 	if atomic.CompareAndSwapInt32(&isMaster, 0, 1) {
 		fmt.Println("  ★ Master appears down — this slave is now acting as master")
@@ -161,7 +155,6 @@ func pushMetadataToMaster(masterURL string, meta *Metadata) {
 }
 
 // masterGuard wraps a handler — only runs it when this slave has been promoted.
-// Returns 503 otherwise so the GUI's discoverMaster() skips this node.
 func masterGuard(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -262,6 +255,7 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 		fmt.Printf("  [promoted] ✓ Dropped table %s.%s\n", req.DBName, req.Table)
 		writeSuccess(w, nil)
 	}))
+
 	http.HandleFunc("/tables/select", masterGuard(func(w http.ResponseWriter, r *http.Request) {
 		dbName := r.URL.Query().Get("db_name")
 		table := r.URL.Query().Get("table")
@@ -279,78 +273,61 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 		fmt.Printf("  [promoted] ✓ SELECT %s.%s → %d rows\n", dbName, table, len(merged))
 		writeSuccess(w, merged)
 	}))
+
 	http.HandleFunc("/tables/insert", masterGuard(func(w http.ResponseWriter, r *http.Request) {
+		/*
+		 * FIX (promoted insert round-robin):
+		 *
+		 * When a slave is promoted it is the SOLE master — there is no other
+		 * master to share the "primary" role with. The correct behaviour is:
+		 *
+		 *   1. Always INSERT the row into THIS slave's primary table so MySQL
+		 *      assigns a deterministic ID via auto_increment_offset.
+		 *   2. Broadcast that row (with its generated ID) as an UPSERT to every
+		 *      peer slave's _replica table for fault-tolerance.
+		 *
+		 * The old counter-based "alternate primary between self and peer" scheme
+		 * was wrong because:
+		 *   a) The peer is not a promoted master; making it own primary rows
+		 *      breaks the auto_increment_offset contract.
+		 *   b) The SELECT-after-INSERT used to retrieve the peer-generated ID
+		 *      had a TOCTOU race: a concurrent insert could make us replicate
+		 *      the wrong row.
+		 */
 		var req InsertRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, "Invalid body")
 			return
 		}
 
-		count := atomic.AddInt64(&promotedInsertCounter, 1)
-		myTurn := count%2 == 1 // odd = this slave, even = peer
-
-		if myTurn {
-			// This slave is primary
-			generatedID, err := insertRowReturnID(db, req.DBName, req.Table, req.Data)
-			if err != nil {
-				writeError(w, err.Error())
-				return
-			}
-			dataWithID := make(map[string]any)
-			for k, v := range req.Data {
-				dataWithID[k] = v
-			}
-			dataWithID["id"] = generatedID
-
-			// Peer gets replica
-			broadcastToPeers(ExecRequest{
-				DBName:    req.DBName,
-				Operation: "UPSERT",
-				Table:     req.Table,
-				Data:      dataWithID,
-				IsReplica: true,
-			})
-			fmt.Printf("  [promoted] ✓ Inserted into %s.%s id=%v (self=primary)\n", req.DBName, req.Table, generatedID)
-
-		} else {
-			// Peer is primary — send insert there
-			if len(peerSlaveURLs) == 0 {
-				writeError(w, "no peer slaves configured")
-				return
-			}
-			peerURL := peerSlaveURLs[0]
-			peerResp, err := sendExecHTTP(peerURL, ExecRequest{
-				DBName:    req.DBName,
-				Operation: "INSERT",
-				Table:     req.Table,
-				Data:      req.Data,
-				IsReplica: false,
-			})
-			if err != nil || !peerResp.Success {
-				writeError(w, "peer INSERT failed")
-				return
-			}
-
-			// Fetch the row the peer just inserted to get its ID
-			selectResp, err := sendExecHTTP(peerURL, ExecRequest{
-				DBName:    req.DBName,
-				Operation: "SELECT",
-				Table:     req.Table,
-				Condition: "1=1 ORDER BY id DESC LIMIT 1",
-				IsReplica: false,
-			})
-			if err == nil && selectResp.Success && len(selectResp.Rows) > 0 {
-				lastRow := selectResp.Rows[0]
-				// Store as replica on this slave
-				if err := upsertRow(db, req.DBName, req.Table+"_replica", lastRow); err != nil {
-					fmt.Printf("  ✗ Could not store replica row: %v\n", err)
-				}
-				fmt.Printf("  [promoted] ✓ Inserted into %s.%s id=%v (peer=primary)\n", req.DBName, req.Table, lastRow["id"])
-			}
+		// Step 1: insert locally, capture the auto-assigned ID.
+		generatedID, err := insertRowReturnID(db, req.DBName, req.Table, req.Data)
+		if err != nil {
+			writeError(w, err.Error())
+			return
 		}
+
+		fmt.Printf("  [promoted] ✓ Inserted into %s.%s id=%v (self=primary)\n",
+			req.DBName, req.Table, generatedID)
+
+		// Step 2: replicate to all peer _replica tables with the exact same ID.
+		dataWithID := make(map[string]any, len(req.Data)+1)
+		for k, v := range req.Data {
+			dataWithID[k] = v
+		}
+		dataWithID["id"] = generatedID
+
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "UPSERT",
+			Table:     req.Table,
+			Data:      dataWithID,
+			IsReplica: true,
+		})
 
 		writeSuccess(w, nil)
 	}))
+
 	http.HandleFunc("/tables/update", masterGuard(func(w http.ResponseWriter, r *http.Request) {
 		var req UpdateRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -416,5 +393,4 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			"slaves": []any{},
 		})
 	}))
-
 }
