@@ -39,12 +39,12 @@ except Exception as e:
 # --- Local metadata copy (master will sync this) ---
 local_meta = {"shards": {}}
 
-master_url = os.environ.get("MASTER_URL", "http://localhost:8095")
+master_url = os.environ.get("MASTER_URL", "http://192.168.1.105:8095")
 
 # FIX (#3 split-brain): read peer slave URLs so we can check if another slave
 # has already promoted before we do. Set via PEER_SLAVE_URLS env var,
 # comma-separated, e.g. "http://localhost:8081"
-peer_slave_urls = ["http://localhost:8081"]
+peer_slave_urls = ["http://192.168.1.105:8081"]
 
 acting_as_master = False
 acting_as_master_lock = threading.Lock()
