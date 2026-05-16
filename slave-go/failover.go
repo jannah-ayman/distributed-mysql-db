@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -81,6 +82,32 @@ func anotherSlaveIsActingAsMaster() bool {
 	return false
 }
 
+// broadcastToPeers sends an ExecRequest to all peer slaves via /internal/exec
+func broadcastToPeers(req ExecRequest) {
+	client := http.Client{Timeout: 5 * time.Second}
+	body, err := json.Marshal(req)
+	if err != nil {
+		fmt.Println("  ✗ Could not marshal peer broadcast:", err)
+		return
+	}
+	for _, peer := range peerSlaveURLs {
+		go func(u string) {
+			httpReq, err := http.NewRequest("POST", u+"/internal/exec", bytes.NewReader(body))
+			if err != nil {
+				return
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("X-Auth-Token", authToken)
+			resp, err := client.Do(httpReq)
+			if err != nil {
+				fmt.Printf("  ✗ Peer broadcast to %s failed: %v\n", u, err)
+				return
+			}
+			resp.Body.Close()
+			fmt.Printf("  ✓ Peer broadcast to %s succeeded\n", u)
+		}(peer)
+	}
+}
 func promote() {
 	if atomic.CompareAndSwapInt32(&isMaster, 0, 1) {
 		fmt.Println("  ★ Master appears down — this slave is now acting as master")
@@ -142,6 +169,10 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			writeError(w, err.Error())
 			return
 		}
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "CREATE_DB",
+		})
 		fmt.Printf("  [promoted] ✓ Created DB %s\n", req.DBName)
 		writeSuccess(w, nil)
 	}))
@@ -156,6 +187,10 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			writeError(w, err.Error())
 			return
 		}
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "DROP_DB",
+		})
 		fmt.Printf("  [promoted] ✓ Dropped DB %s\n", req.DBName)
 		writeSuccess(w, nil)
 	}))
@@ -171,6 +206,12 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			return
 		}
 		_ = createTable(db, req.DBName, req.Table+"_replica", req.Columns)
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "CREATE_TABLE",
+			Table:     req.Table,
+			Columns:   req.Columns,
+		})
 		localMeta.Shards[req.Table] = map[string]ShardInfo{
 			"shard_1": {URL: "self", DBName: req.DBName},
 		}
@@ -189,6 +230,11 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			return
 		}
 		_ = dropTable(db, req.DBName, req.Table+"_replica")
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "DROP_TABLE",
+			Table:     req.Table,
+		})
 		delete(localMeta.Shards, req.Table)
 		fmt.Printf("  [promoted] ✓ Dropped table %s.%s\n", req.DBName, req.Table)
 		writeSuccess(w, nil)
@@ -204,6 +250,14 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			writeError(w, err.Error())
 			return
 		}
+		// send as replica to peers
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "INSERT",
+			Table:     req.Table,
+			Data:      req.Data,
+			IsReplica: true,
+		})
 		fmt.Printf("  [promoted] ✓ Inserted into %s.%s\n", req.DBName, req.Table)
 		writeSuccess(w, nil)
 	}))
@@ -238,6 +292,22 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 			writeError(w, err1.Error())
 			return
 		}
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "UPDATE",
+			Table:     req.Table,
+			Data:      req.Data,
+			Condition: req.Condition,
+			IsReplica: false,
+		})
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "UPDATE",
+			Table:     req.Table,
+			Data:      req.Data,
+			Condition: req.Condition,
+			IsReplica: true,
+		})
 		fmt.Printf("  [promoted] ✓ Updated %s.%s\n", req.DBName, req.Table)
 		writeSuccess(w, nil)
 	}))
@@ -250,6 +320,20 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 		}
 		_ = deleteRows(db, req.DBName, req.Table, req.Condition)
 		_ = deleteRows(db, req.DBName, req.Table+"_replica", req.Condition)
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "DELETE",
+			Table:     req.Table,
+			Condition: req.Condition,
+			IsReplica: false,
+		})
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "DELETE",
+			Table:     req.Table,
+			Condition: req.Condition,
+			IsReplica: true,
+		})
 		fmt.Printf("  [promoted] ✓ Deleted from %s.%s\n", req.DBName, req.Table)
 		writeSuccess(w, nil)
 	}))

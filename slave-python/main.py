@@ -12,7 +12,7 @@ AUTH_TOKEN_HASH = hashlib.sha256(AUTH_TOKEN.encode()).hexdigest()
 app = Flask(__name__)
 
 # --- MySQL connection ---
-DSN = os.environ.get("MYSQL_DSN", "root:password@127.0.0.1:3306")
+DSN = os.environ.get("MYSQL_DSN", "root:1234@127.0.0.1:3306")
 conn = get_connection(DSN)
 print("✓ Connected to MySQL")
 
@@ -187,14 +187,16 @@ def merge_rows(*all_rows):
                 merged.append(row)
     return merged
 
-
 @app.route("/db/create", methods=["POST", "OPTIONS"])
 @require_master
 def promoted_create_db():
     body = request.get_json()
     try:
         create_database(conn, body["db_name"])
-        print(f"  [promoted] ✓ Created DB {body['db_name']}")
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "CREATE_DB"
+        })
         return jsonify({"success": True, "message": "Database created"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -206,7 +208,10 @@ def promoted_drop_db():
     body = request.get_json()
     try:
         drop_database(conn, body["db_name"])
-        print(f"  [promoted] ✓ Dropped DB {body['db_name']}")
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "DROP_DB"
+        })
         return jsonify({"success": True, "message": "Database dropped"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -222,6 +227,12 @@ def promoted_create_table():
             create_table(conn, body["db_name"], body["table"] + "_replica", body.get("columns", {}))
         except Exception:
             pass
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "CREATE_TABLE",
+            "table": body["table"],
+            "columns": body.get("columns", {})
+        })
         local_meta.setdefault("shards", {})[body["table"]] = {
             "shard_1": {"url": "self", "db_name": body["db_name"]}
         }
@@ -240,6 +251,11 @@ def promoted_drop_table():
             drop_table(conn, body["db_name"], body["table"] + "_replica")
         except Exception:
             pass
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "DROP_TABLE",
+            "table": body["table"]
+        })
         local_meta.get("shards", {}).pop(body["table"], None)
         return jsonify({"success": True, "message": "Table dropped"}), 200
     except Exception as e:
@@ -252,6 +268,14 @@ def promoted_insert():
     body = request.get_json()
     try:
         insert_row(conn, body["db_name"], body["table"], body.get("data", {}))
+        # also write as replica on peer
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "INSERT",
+            "table": body["table"],
+            "data": body.get("data", {}),
+            "is_replica": True
+        })
         return jsonify({"success": True, "message": "Row inserted"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -285,6 +309,22 @@ def promoted_update():
             update_rows(conn, body["db_name"], body["table"] + "_replica", body.get("data", {}), body.get("condition", ""))
         except Exception:
             pass
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "UPDATE",
+            "table": body["table"],
+            "data": body.get("data", {}),
+            "condition": body.get("condition", ""),
+            "is_replica": False
+        })
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "UPDATE",
+            "table": body["table"],
+            "data": body.get("data", {}),
+            "condition": body.get("condition", ""),
+            "is_replica": True
+        })
         return jsonify({"success": True, "message": "Row updated"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -300,10 +340,23 @@ def promoted_delete():
             delete_rows(conn, body["db_name"], body["table"] + "_replica", body.get("condition", ""))
         except Exception:
             pass
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "DELETE",
+            "table": body["table"],
+            "condition": body.get("condition", ""),
+            "is_replica": False
+        })
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": body["db_name"],
+            "operation": "DELETE",
+            "table": body["table"],
+            "condition": body.get("condition", ""),
+            "is_replica": True
+        })
         return jsonify({"success": True, "message": "Row deleted"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/health", methods=["GET", "OPTIONS"])
 @require_master
@@ -342,6 +395,18 @@ def another_slave_is_acting_as_master() -> bool:
             pass
     return False
 
+def broadcast_to_peers(method, path, body=None, params=None):
+    for peer in peer_slave_urls:
+        try:
+            requests.request(
+                method, peer + path,
+                json=body,
+                params=params,
+                headers={"X-Auth-Token": AUTH_TOKEN},
+                timeout=5
+            )
+        except Exception as e:
+            print(f"  ✗ Peer broadcast to {peer} failed: {e}")
 
 def watch_master():
     global acting_as_master
@@ -397,4 +462,4 @@ threading.Thread(target=watch_master, daemon=True).start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8082))
     print(f"Slave (Python) running on port {port}...")
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="192.168.1.108", port=port)
