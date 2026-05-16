@@ -260,7 +260,6 @@ def promoted_drop_table():
         return jsonify({"success": True, "message": "Table dropped"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 @app.route("/tables/insert", methods=["POST", "OPTIONS"])
 @require_master
 def promoted_insert():
@@ -268,9 +267,9 @@ def promoted_insert():
     db_name = body["db_name"]
     table = body["table"]
     data = body.get("data", {})
-    
+
     try:
-        # Insert on this slave and get the generated ID
+        # Insert on this slave as primary, get the generated ID
         cursor = conn.cursor()
         cols = ", ".join(f"`{c}`" for c in data.keys())
         placeholders = ", ".join(["%s"] * len(data))
@@ -280,35 +279,21 @@ def promoted_insert():
         )
         generated_id = cursor.lastrowid
         cursor.close()
-        
-        # Also insert into own replica table with the same ID
-        data_with_id = {**data, "id": generated_id}
-        try:
-            insert_row(conn, db_name, table + "_replica", data_with_id)
-        except Exception:
-            pass
 
-        # Broadcast to peers with the SAME id, as PRIMARY (not replica)
-        broadcast_to_peers("POST", "/internal/exec", {
-            "db_name": db_name,
-            "operation": "UPSERT",   # upsert so id doesn't conflict
-            "table": table,
-            "data": data_with_id,
-            "is_replica": False      # primary on peer too
-        })
-        # Also as replica on peer
+        # Broadcast to peer as replica WITH the same ID
+        data_with_id = {**data, "id": generated_id}
         broadcast_to_peers("POST", "/internal/exec", {
             "db_name": db_name,
             "operation": "UPSERT",
             "table": table,
             "data": data_with_id,
-            "is_replica": True
+            "is_replica": True   # peer stores it as replica only
         })
 
         return jsonify({"success": True, "message": "Row inserted"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
+    
 @app.route("/tables/select", methods=["GET", "OPTIONS"])
 @require_master
 def promoted_select():
