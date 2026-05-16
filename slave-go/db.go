@@ -170,3 +170,29 @@ func deleteRows(db *sql.DB, dbName, table, condition string) error {
 	_, err := db.Exec(query)
 	return err
 }
+func upsertRow(db *sql.DB, dbName, table string, data map[string]any) error {
+	cols := make([]string, 0, len(data))
+	placeholders := make([]string, 0, len(data))
+	updates := make([]string, 0, len(data))
+	values := make([]any, 0, len(data))
+
+	for col, val := range data {
+		cols = append(cols, fmt.Sprintf("`%s`", col))
+		placeholders = append(placeholders, "?")
+		values = append(values, val)
+		if col != "id" {
+			updates = append(updates, fmt.Sprintf("`%s` = VALUES(`%s`)", col, col))
+		}
+	}
+
+	query := fmt.Sprintf(
+		"INSERT INTO `%s`.`%s` (%s) VALUES (%s) ON DUPLICATE KEY UPDATE %s",
+		dbName, table,
+		strings.Join(cols, ", "),
+		strings.Join(placeholders, ", "),
+		strings.Join(updates, ", "),
+	)
+
+	_, err := db.Exec(query, values...)
+	return err
+}

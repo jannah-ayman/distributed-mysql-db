@@ -111,6 +111,13 @@ func execHandler(db *sql.DB) http.HandlerFunc {
 			}
 			fmt.Printf("  ✓ Inserted into %s.%s\n", req.DBName, table)
 			writeSuccess(w, nil)
+		case "UPSERT":
+			if err := upsertRow(db, req.DBName, table, req.Data); err != nil {
+				writeError(w, "UPSERT failed: "+err.Error())
+				return
+			}
+			fmt.Printf("  ✓ Upserted into %s.%s\n", req.DBName, table)
+			writeSuccess(w, nil)
 
 		case "SELECT":
 			rows, err := selectRows(db, req.DBName, table, req.Condition)

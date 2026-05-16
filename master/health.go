@@ -166,47 +166,15 @@ func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 		fmt.Printf("  → Recovery: %d rows to replay into %s on %s\n", len(rows), dbTable, recoveredURL)
 
 		for _, row := range rows {
-			id := fmt.Sprintf("%v", row["id"])
-
-			// Step 1: try UPDATE first — idempotent and safe if row exists.
-			// Build data without the id field for the SET clause.
-			updateData := make(map[string]any, len(row)-1)
-			for k, v := range row {
-				if k != "id" {
-					updateData[k] = v
-				}
-			}
-
-			updReq := ExecRequest{
+			upsertReq := ExecRequest{
 				DBName:    dbName,
-				Operation: "UPDATE",
+				Operation: "UPSERT",
 				Table:     dbTable,
-				Data:      updateData,
-				Condition: "id = " + id,
+				Data:      row, // includes id this time
 				IsReplica: false,
 			}
-			updResp, updErr := sendExec(client, recoveredURL, updReq)
-
-			// Step 2: if UPDATE failed or touched 0 rows (row is missing),
-			// INSERT without the id key so MySQL auto-assigns it.
-			// FIX (#4/#9): never pass "id" in the INSERT data to avoid PK conflicts.
-			if updErr != nil || !updResp {
-				insertData := make(map[string]any, len(row)-1)
-				for k, v := range row {
-					if k != "id" {
-						insertData[k] = v
-					}
-				}
-				insReq := ExecRequest{
-					DBName:    dbName,
-					Operation: "INSERT",
-					Table:     dbTable,
-					Data:      insertData,
-					IsReplica: false,
-				}
-				if _, insErr := sendExec(client, recoveredURL, insReq); insErr != nil {
-					fmt.Printf("  ✗ Recovery INSERT id=%s into %s failed: %v\n", id, dbTable, insErr)
-				}
+			if _, err := sendExec(client, recoveredURL, upsertReq); err != nil {
+				fmt.Printf("  ✗ Recovery UPSERT id=%v into %s failed: %v\n", row["id"], dbTable, err)
 			}
 		}
 
@@ -215,8 +183,6 @@ func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 }
 
 // sendExec sends an ExecRequest and returns (success bool, error).
-// FIX (#4): now returns the success flag so callers can decide whether to
-// fall back to INSERT.
 func sendExec(client http.Client, url string, req ExecRequest) (bool, error) {
 	body, err := json.Marshal(req)
 	if err != nil {

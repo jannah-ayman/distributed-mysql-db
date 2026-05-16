@@ -112,7 +112,7 @@ def update_rows(conn, db_name: str, table: str, data: dict, condition: str):
 def delete_rows(conn, db_name: str, table: str, condition: str):
     query = f"DELETE FROM `{db_name}`.`{table}`"
     if condition:
-        query += f" WHERE {condition}"
+        query += " WHERE " + condition
 
     cursor = conn.cursor()
     cursor.execute(query)

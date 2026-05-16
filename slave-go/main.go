@@ -66,6 +66,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 	fmt.Println("✓ Connected to MySQL")
 
 	slaveIndex := os.Getenv("SLAVE_INDEX")
