@@ -47,9 +47,11 @@ func main() {
 		port = "8081"
 	}
 	/*
-	   "http://192.168.165.41:8085", // master
-	   "http://192.168.165.23:8081", // slave go
-	   "http://192.168.165.117:8082" //slave python
+			       const KNOWN_NODES = [
+		      "http://172.20.10.2:8085", // master
+		      "http://172.20.10.7:8081", // slave go
+		      "http://172.20.10.1:8082" //slave python
+		    ]
 	*/
 	dsn := os.Getenv("MYSQL_DSN")
 	if dsn == "" {
@@ -58,11 +60,11 @@ func main() {
 
 	masterURL := os.Getenv("MASTER_URL")
 	if masterURL == "" {
-		masterURL = "http://192.168.165.41:8085"
+		masterURL = "http://172.20.10.2:8085"
 	}
 
 	// check whether another slave has already promoted before self-promoting.
-	peerSlaveURLs = []string{"http://192.168.165.117:8082"}
+	peerSlaveURLs = []string{"http://172.20.10.4:8082"}
 
 	db, err := openDB(dsn)
 	if err != nil {
@@ -127,7 +129,7 @@ func main() {
 
 	go watchMaster(masterURL, db, localMeta)
 
-	if err := http.ListenAndServe("192.168.165.23:"+port, nil); err != nil {
+	if err := http.ListenAndServe("172.20.10.7:"+port, nil); err != nil {
 		fmt.Println("✗ Server error:", err)
 	}
 }

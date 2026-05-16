@@ -655,9 +655,9 @@
 
     // Real master first, then slaves (which may be promoted).
     const KNOWN_NODES = [
-      "http://192.168.165.41:8085", // master
-      "http://192.168.165.23:8081", // slave go
-      "http://192.168.165.117:8082" //slave python
+      "http://172.20.10.2:8085", // master
+      "http://172.20.10.7:8081", // slave go
+      "http://172.20.10.4:8082" //slave python
     ]
 
     // The real master port — used to skip the /promote check for the master itself.
@@ -670,16 +670,22 @@
 
     let activeMaster = REAL_MASTER
 
-    // ---- Master discovery ----
-    // FIX (#6): The old code picked the first node that replied to /ping,
-    // which could be a non-promoted slave — those reply 200 to /ping but
-    // return 503 on every real API call. The fix:
-    //   1. Try the real master first — if it replies, use it (no /promote check needed).
-    //   2. For slave nodes, also check /promote and only use them if
-    //      acting_master === true. This ensures we only talk to a slave
-    //      when it has actually taken over.
     async function discoverMaster() {
+      // Always try the real master first
+      try {
+        const r = await fetch(REAL_MASTER + "/ping", {
+          headers,
+          signal: AbortSignal.timeout(2000)
+        })
+        if (r.ok) {
+          setActiveMaster(REAL_MASTER)
+          return
+        }
+      } catch { /* master is down, check slaves */ }
+
+      // Only check slaves if master is actually unreachable
       for (const node of KNOWN_NODES) {
+        if (node === REAL_MASTER) continue  // already tried above
         try {
           const r = await fetch(node + "/ping", {
             headers,
@@ -687,33 +693,19 @@
           })
           if (!r.ok) continue
 
-          // The real master doesn't need a /promote check.
-          if (node === REAL_MASTER) {
+          const pr = await fetch(node + "/promote", {
+            headers,
+            signal: AbortSignal.timeout(2000)
+          })
+          const pd = await pr.json()
+          if (pd.acting_master) {
             setActiveMaster(node)
             return
           }
-
-          // For slave nodes, verify they are actually acting as master.
-          // FIX (#6): without this check we'd send all requests to a normal
-          // slave which returns 503 on every GUI-facing endpoint.
-          try {
-            const pr = await fetch(node + "/promote", {
-              headers,
-              signal: AbortSignal.timeout(2000)
-            })
-            const pd = await pr.json()
-            if (pd.acting_master) {
-              setActiveMaster(node)
-              return
-            }
-          } catch {
-            // /promote unreachable — skip this node
-          }
-        } catch { /* node unreachable, try next */ }
+        } catch { }
       }
       console.warn("No active master found")
     }
-
     function setActiveMaster(node) {
       activeMaster = node
       const label = node === REAL_MASTER
