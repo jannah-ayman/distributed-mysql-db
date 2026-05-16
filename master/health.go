@@ -137,7 +137,7 @@ func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 			DBName:    dbName,
 			Operation: "SELECT",
 			Table:     dbTable,
-			IsReplica: true,
+			IsReplica: false,
 		}
 		body, _ := json.Marshal(fetchReq)
 		httpReq, err := http.NewRequest("POST", donorURL+"/internal/exec", bytes.NewReader(body))
@@ -170,8 +170,8 @@ func syncSlaveOnRecovery(recoveredURL, donorURL string, meta *Metadata) {
 				DBName:    dbName,
 				Operation: "UPSERT",
 				Table:     dbTable,
-				Data:      row, // includes id this time
-				IsReplica: false,
+				Data:      row,
+				IsReplica: true,
 			}
 			if _, err := sendExec(client, recoveredURL, upsertReq); err != nil {
 				fmt.Printf("  ✗ Recovery UPSERT id=%v into %s failed: %v\n", row["id"], dbTable, err)

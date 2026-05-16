@@ -15,8 +15,8 @@ const authToken = "my-secret-token-123"
 var authTokenHash = fmt.Sprintf("%x", sha256.Sum256([]byte(authToken)))
 
 var allSlaves = []string{
-	"http://localhost:8081", // slave-go
-	"http://localhost:8082", // slave-python
+	// "http://localhost:8081",     // slave-go
+	"http://192.168.1.108:8082", // slave-python
 }
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -177,7 +177,7 @@ func main() {
 	http.HandleFunc("/health", corsMiddleware(handleHealth(state)))
 
 	fmt.Println("Master running on port " + port + "...")
-	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
+	if err := http.ListenAndServe("192.168.1.105:"+port, nil); err != nil {
 		fmt.Println("✗ Server error:", err)
 	}
 }

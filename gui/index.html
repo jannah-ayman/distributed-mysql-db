@@ -468,11 +468,11 @@
       </div>
       <div class="health-node">
         <div class="health-dot" id="h-slave1"></div>
-        slave-go
+        slave
       </div>
       <div class="health-node">
         <div class="health-dot" id="h-slave2"></div>
-        slave-py
+        slave
       </div>
     </div>
   </aside>
@@ -655,9 +655,9 @@
 
     // Real master first, then slaves (which may be promoted).
     const KNOWN_NODES = [
-      "http://localhost:8095",
+      "http://192.168.1.105:8095", // master
       "http://localhost:8081",
-      "http://localhost:8082"
+      "https://192.168.1.108:8082"
     ]
 
     // The real master port — used to skip the /promote check for the master itself.
