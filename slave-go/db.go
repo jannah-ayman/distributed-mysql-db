@@ -170,6 +170,30 @@ func deleteRows(db *sql.DB, dbName, table, condition string) error {
 	_, err := db.Exec(query)
 	return err
 }
+func insertRowReturnID(db *sql.DB, dbName, table string, data map[string]any) (int64, error) {
+	cols := make([]string, 0, len(data))
+	placeholders := make([]string, 0, len(data))
+	values := make([]any, 0, len(data))
+
+	for col, val := range data {
+		cols = append(cols, fmt.Sprintf("`%s`", col))
+		placeholders = append(placeholders, "?")
+		values = append(values, val)
+	}
+
+	query := fmt.Sprintf(
+		"INSERT INTO `%s`.`%s` (%s) VALUES (%s)",
+		dbName, table,
+		strings.Join(cols, ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	result, err := db.Exec(query, values...)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
 func upsertRow(db *sql.DB, dbName, table string, data map[string]any) error {
 	cols := make([]string, 0, len(data))
 	placeholders := make([]string, 0, len(data))

@@ -261,25 +261,53 @@ def promoted_drop_table():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/tables/insert", methods=["POST", "OPTIONS"])
 @require_master
 def promoted_insert():
     body = request.get_json()
+    db_name = body["db_name"]
+    table = body["table"]
+    data = body.get("data", {})
+    
     try:
-        insert_row(conn, body["db_name"], body["table"], body.get("data", {}))
-        # also write as replica on peer
+        # Insert on this slave and get the generated ID
+        cursor = conn.cursor()
+        cols = ", ".join(f"`{c}`" for c in data.keys())
+        placeholders = ", ".join(["%s"] * len(data))
+        cursor.execute(
+            f"INSERT INTO `{db_name}`.`{table}` ({cols}) VALUES ({placeholders})",
+            list(data.values())
+        )
+        generated_id = cursor.lastrowid
+        cursor.close()
+        
+        # Also insert into own replica table with the same ID
+        data_with_id = {**data, "id": generated_id}
+        try:
+            insert_row(conn, db_name, table + "_replica", data_with_id)
+        except Exception:
+            pass
+
+        # Broadcast to peers with the SAME id, as PRIMARY (not replica)
         broadcast_to_peers("POST", "/internal/exec", {
-            "db_name": body["db_name"],
-            "operation": "INSERT",
-            "table": body["table"],
-            "data": body.get("data", {}),
+            "db_name": db_name,
+            "operation": "UPSERT",   # upsert so id doesn't conflict
+            "table": table,
+            "data": data_with_id,
+            "is_replica": False      # primary on peer too
+        })
+        # Also as replica on peer
+        broadcast_to_peers("POST", "/internal/exec", {
+            "db_name": db_name,
+            "operation": "UPSERT",
+            "table": table,
+            "data": data_with_id,
             "is_replica": True
         })
+
         return jsonify({"success": True, "message": "Row inserted"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/tables/select", methods=["GET", "OPTIONS"])
 @require_master

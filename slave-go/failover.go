@@ -239,29 +239,49 @@ func registerMasterRoutes(db *sql.DB, localMeta *Metadata) {
 		fmt.Printf("  [promoted] ✓ Dropped table %s.%s\n", req.DBName, req.Table)
 		writeSuccess(w, nil)
 	}))
-
 	http.HandleFunc("/tables/insert", masterGuard(func(w http.ResponseWriter, r *http.Request) {
 		var req InsertRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, "Invalid body")
 			return
 		}
-		if err := insertRow(db, req.DBName, req.Table, req.Data); err != nil {
+
+		// Insert and get the generated ID
+		generatedID, err := insertRowReturnID(db, req.DBName, req.Table, req.Data)
+		if err != nil {
 			writeError(w, err.Error())
 			return
 		}
-		// send as replica to peers
+
+		// Add the real ID to data so peers store the same ID
+		dataWithID := make(map[string]any)
+		for k, v := range req.Data {
+			dataWithID[k] = v
+		}
+		dataWithID["id"] = generatedID
+
+		// Also insert into own replica with same ID
+		_ = upsertRow(db, req.DBName, req.Table+"_replica", dataWithID)
+
+		// Broadcast to peers as primary AND replica with same ID
 		broadcastToPeers(ExecRequest{
 			DBName:    req.DBName,
-			Operation: "INSERT",
+			Operation: "UPSERT",
 			Table:     req.Table,
-			Data:      req.Data,
+			Data:      dataWithID,
+			IsReplica: false,
+		})
+		broadcastToPeers(ExecRequest{
+			DBName:    req.DBName,
+			Operation: "UPSERT",
+			Table:     req.Table,
+			Data:      dataWithID,
 			IsReplica: true,
 		})
-		fmt.Printf("  [promoted] ✓ Inserted into %s.%s\n", req.DBName, req.Table)
+
+		fmt.Printf("  [promoted] ✓ Inserted into %s.%s id=%v\n", req.DBName, req.Table, generatedID)
 		writeSuccess(w, nil)
 	}))
-
 	http.HandleFunc("/tables/select", masterGuard(func(w http.ResponseWriter, r *http.Request) {
 		dbName := r.URL.Query().Get("db_name")
 		table := r.URL.Query().Get("table")
