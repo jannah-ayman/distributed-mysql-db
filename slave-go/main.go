@@ -49,16 +49,16 @@ func main() {
 
 	dsn := os.Getenv("MYSQL_DSN")
 	if dsn == "" {
-		dsn = "root:password@tcp(127.0.0.1:3306)/"
+		dsn = "root:rootroot@tcp(127.0.0.1:3306)/"
 	}
 
 	masterURL := os.Getenv("MASTER_URL")
 	if masterURL == "" {
-		masterURL = "http://localhost:8095"
+		masterURL = "http://192.168.1.105:8095"
 	}
 
 	// check whether another slave has already promoted before self-promoting.
-	peerSlaveURLs = []string{"http://localhost:8082"}
+	peerSlaveURLs = []string{"http://192.168.1.108:8082"}
 
 	db, err := openDB(dsn)
 	if err != nil {
@@ -123,7 +123,7 @@ func main() {
 
 	go watchMaster(masterURL, db, localMeta)
 
-	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
+	if err := http.ListenAndServe("192.168.1.105:"+port, nil); err != nil {
 		fmt.Println("✗ Server error:", err)
 	}
 }

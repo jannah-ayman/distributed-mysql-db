@@ -656,7 +656,7 @@
     // Real master first, then slaves (which may be promoted).
     const KNOWN_NODES = [
       "http://192.168.1.105:8095", // master
-      "http://localhost:8081",
+      "http://192.168.1.105:8081",
       "https://192.168.1.108:8082"
     ]
 
@@ -742,13 +742,25 @@
           signal: AbortSignal.timeout(3000)
         })
         const d = await r.json()
+
+        // master dot — green whether real master or promoted slave
         document.getElementById("h-master").className = "health-dot online"
-        if (d.slaves) {
-          const s1 = document.getElementById("h-slave1")
-          const s2 = document.getElementById("h-slave2")
-          if (d.slaves[0]) s1.className = "health-dot " + (d.slaves[0].online ? "online" : "offline")
-          if (d.slaves[1]) s2.className = "health-dot " + (d.slaves[1].online ? "online" : "offline")
+
+        const s1 = document.getElementById("h-slave1")
+        const s2 = document.getElementById("h-slave2")
+
+        if (d.master === "promoted-slave") {
+          // a slave is acting as master — show slaves differently
+          s1.className = "health-dot online"   // at least one slave is up (the promoted one)
+          s2.className = "health-dot offline"  // real master is down, show as offline
+        } else {
+          // normal case — read from d.slaves[]
+          if (d.slaves && d.slaves[0])
+            s1.className = "health-dot " + (d.slaves[0].online ? "online" : "offline")
+          if (d.slaves && d.slaves[1])
+            s2.className = "health-dot " + (d.slaves[1].online ? "online" : "offline")
         }
+
       } catch {
         document.getElementById("h-master").className = "health-dot offline"
         await discoverMaster()
