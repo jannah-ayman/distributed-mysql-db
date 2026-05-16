@@ -11,6 +11,16 @@
         "url": "self",
         "db_name": "jannahv1"
       }
+    },
+    "table": {
+      "shard_1": {
+        "url": "http://172.20.10.7:8081",
+        "db_name": "a5r_la7za"
+      },
+      "shard_2": {
+        "url": "http://172.20.10.4:8082",
+        "db_name": "a5r_la7za"
+      }
     }
   }
 }
